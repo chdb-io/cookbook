@@ -1,0 +1,121 @@
+{
+  "machine": {
+    "platform": "macOS-26.4.1-arm64-arm-64bit",
+    "python": "3.9.6"
+  },
+  "engines": {
+    "duckdb_version": "1.4.4",
+    "chdb_version": "4.1.6"
+  },
+  "runs_per_engine": 3,
+  "comparison": [
+    {
+      "name": "Q1 JSON GROUP BY response.status",
+      "duckdb_ms": 33.25991700000003,
+      "chdb_ms": 4.167000000000032,
+      "speedup": 7.981741540676692
+    },
+    {
+      "name": "Q2 JSON GROUP BY user.tier + avg(latency)",
+      "duckdb_ms": 63.128499999999974,
+      "chdb_ms": 24.23112500000002,
+      "speedup": 2.60526492269756
+    },
+    {
+      "name": "Q3 JSON filter + group",
+      "duckdb_ms": 35.88412499999993,
+      "chdb_ms": 9.535791999999987,
+      "speedup": 3.7630985449347034
+    },
+    {
+      "name": "Q4 pandas groupby agg (DataStore baseline)",
+      "duckdb_ms": 62.41054199999996,
+      "chdb_ms": 13.737833000000087,
+      "speedup": 4.542968457980204
+    },
+    {
+      "name": "Q5 vector top-10 cosine",
+      "duckdb_ms": 34.07291599999995,
+      "chdb_ms": 63.71725000000006,
+      "speedup": 0.5347518293711658
+    },
+    {
+      "name": "Q6 funnel (CTE approx)",
+      "duckdb_ms": 268.429083,
+      "chdb_ms": 107.2458340000002,
+      "speedup": 2.5029324961937403
+    },
+    {
+      "name": "Q7 sequence pattern (CTE)",
+      "duckdb_ms": 228.5502079999999,
+      "chdb_ms": 50.496666999999995,
+      "speedup": 4.526045412066502
+    },
+    {
+      "name": "Q8 approx_quantile \u00d7 3 (p50/p95/p99)",
+      "duckdb_ms": 138.77504099999993,
+      "chdb_ms": 27.016707999999888,
+      "speedup": 5.136637705822653
+    },
+    {
+      "name": "Q9 aggregate",
+      "duckdb_ms": 14.56037500000007,
+      "chdb_ms": 19.32062499999998,
+      "speedup": 0.7536182188723235
+    },
+    {
+      "name": "Q10 group+filter",
+      "duckdb_ms": 14.372457999999977,
+      "chdb_ms": 29.89404200000001,
+      "speedup": 0.48078001629889905
+    },
+    {
+      "name": "Q11 time bucket date_trunc",
+      "duckdb_ms": 36.8656249999999,
+      "chdb_ms": 29.932041999999768,
+      "speedup": 1.2316441691482387
+    },
+    {
+      "name": "Q12 approx_count_distinct",
+      "duckdb_ms": 12.099542000000074,
+      "chdb_ms": 23.42104200000028,
+      "speedup": 0.5166098929330271
+    },
+    {
+      "name": "Q13 DataFrame roundtrip (narrow)",
+      "duckdb_ms": 6.2894579999999145,
+      "chdb_ms": 12.401207999999997,
+      "speedup": 0.5071649471567541
+    },
+    {
+      "name": "Q14 topK pickup zones",
+      "duckdb_ms": 7.3067499999999175,
+      "chdb_ms": 11.664750000000002,
+      "speedup": 0.6263957650185316
+    },
+    {
+      "name": "Q15 DataFrame roundtrip (wide, 19 cols)",
+      "duckdb_ms": 7.707708000000091,
+      "chdb_ms": 12.633458999999903,
+      "speedup": 0.6101027438328767
+    },
+    {
+      "name": "Q16 persistent storage (load+5q)",
+      "duckdb_ms": 125.737416,
+      "chdb_ms": 1861.8274999999994,
+      "speedup": 0.06753440692008257
+    },
+    {
+      "name": "Q17 PK range scan",
+      "duckdb_ms": 0.43112500000042075,
+      "chdb_ms": 3.0027079999994655,
+      "speedup": 0.14357872960024667
+    },
+    {
+      "name": "Q18 Parquet \u2192 DataFrame export",
+      "duckdb_ms": 312.99624999999986,
+      "chdb_ms": 234.42579100000006,
+      "speedup": 1.335161326169951
+    }
+  ]
+}
