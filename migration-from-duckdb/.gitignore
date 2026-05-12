@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+benchmark/*.parquet
+benchmark/query_vec.json
