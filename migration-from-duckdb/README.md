@@ -15,7 +15,9 @@ migration-from-duckdb/
     ├── workload_aligned_chdb.py   # same 18 queries, migrated to chDB
     ├── run_aligned.py             # 3-run-median benchmark runner
     ├── gen_data.py                # synthesises JSON events + embedding vectors
-    └── results_aligned.json       # canonical run on Apple M5 Max / chDB 4.1.6 / DuckDB 1.4.4
+    ├── results_aligned.json       # canonical run on Apple M5 Max / chDB 4.1.6 / DuckDB 1.4.4
+    ├── bench_input_path_scale.py  # supplementary: input path vs scale (3M / 10M / 18M)
+    └── bench_input_path_variants.py # supplementary: input path vs op-type and width
 ```
 
 ## Reproduce in five minutes
@@ -56,6 +58,32 @@ python migrate.py /path/to/your/project --dialect-only
 (import, connect, `read_parquet`, `date_trunc`, `approx_count_distinct`,
 `register(...)`, etc.) plus dialect-review items that need human judgment
 (`PIVOT`, `INSTALL`, `STRUCT`, `CREATE INDEX`).
+
+## Supplementary input-path benchmarks
+
+The two `bench_input_path_*.py` scripts back up the §5 "Reading the numbers
+honestly" claim that DataFrame *input* via `Python(df)` is operation-dependent
+(not a flat DuckDB win as Q13 / Q15 alone might suggest).
+
+```bash
+# 1. Vary row count, fix the operation
+python benchmark/bench_input_path_scale.py
+#    3 M / 10 M / 18 M rows on the NYC TLC base, GROUP BY,
+#    warm in-process iterations.
+
+# 2. Vary the operation, fix the scale (10 M rows)
+python benchmark/bench_input_path_variants.py
+#    V1 COUNT(*) / V2 filter + COUNT / V3 GROUP BY (19 cols),
+#    V4 GROUP BY / V5 COUNT(*) on a synthetically widened 60-col DataFrame.
+```
+
+Headline result (Apple M5 Max, chDB 4.1.6 vs DuckDB 1.4.4, warm in-process):
+
+- chDB wins on lightweight aggregates: `COUNT(*)` 1.4×, `filter + COUNT` 1.1×,
+  wide-DataFrame `COUNT(*)` 2.1×.
+- DuckDB wins on `GROUP BY` by 1.0–1.3×; gap is stable across 3 M / 10 M / 18 M.
+- Consistent with the chDB v4 zero-copy blog's "7:3 advantage across 14 ops at
+  10 M rows" claim — op type matters more than engine choice.
 
 ## Reference hardware
 
