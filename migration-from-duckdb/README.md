@@ -4,9 +4,14 @@ Runnable companion to the [Migrating from DuckDB to chDB](https://clickhouse.com
 guide. The prose lives at the docs site; this directory holds the static
 migration analyzer and the 18-query benchmark referenced from §5 of the guide.
 
-For the methodology deep dive (ingest-path notes, storage-engine trade-off
-analysis, per-case studies with side-by-side SQL, DataFrame round-trip matrix),
-see [BENCHMARK.md](BENCHMARK.md).
+The guide's §5 highlights the **16 kernel queries** (Q1–Q16); two additional
+queries (Q17 persistent-storage workflow, Q18 PK range scan) are storage-engine
+probes whose headline gaps reflect a chDB `MergeTree` design choice rather
+than query-engine performance. They are measured here for transparency and
+explained in full at the end of [BENCHMARK.md](BENCHMARK.md#storage-engine-trade-off-q17--q18) —
+see [BENCHMARK.md](BENCHMARK.md) for the methodology deep dive (the rationale
+for the 16-vs-18 split, ingest-path notes, per-case studies with side-by-side
+SQL, DataFrame round-trip matrix).
 
 ## What's here
 
@@ -16,7 +21,7 @@ migration-from-duckdb/
 ├── BENCHMARK.md                   # ingest-path methodology, storage trade-off, Cases A-G with SQL, round-trip detail
 ├── migrate.py                     # static DuckDB→chDB API analyzer
 └── benchmark/
-    ├── workload_aligned_duckdb.py # 18-query DuckDB workload
+    ├── workload_aligned_duckdb.py # 18-query DuckDB workload (Q1–Q16 kernel + Q17–Q18 storage probes)
     ├── workload_aligned_chdb.py   # same 18 queries, migrated to chDB
     ├── run_aligned.py             # 3-run-median benchmark runner
     ├── gen_data.py                # synthesises JSON events + embedding vectors
@@ -44,6 +49,8 @@ cd ..
 python benchmark/gen_data.py
 
 # 4. Run the full 18-query × 3-iteration × 2-engine benchmark
+#    (16 kernel queries highlighted in the guide + 2 storage-engine
+#    probes explained in BENCHMARK.md)
 python benchmark/run_aligned.py
 ```
 

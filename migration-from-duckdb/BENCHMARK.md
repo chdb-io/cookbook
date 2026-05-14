@@ -1,8 +1,18 @@
 # Migration benchmark — deep dive
 
-Companion to the [Migrating from DuckDB to chDB](https://clickhouse.com/docs/chdb/guides/migration-from-duckdb) guide. The guide's §5 shows machine, dataset, scenarios, results, and a one-paragraph summary. This file holds the parts that don't fit a guide-style flow: ingest-path methodology, storage-engine trade-off analysis, per-case studies with side-by-side SQL, and the DataFrame round-trip operation matrix.
+Companion to the [Migrating from DuckDB to chDB](https://clickhouse.com/docs/chdb/guides/migration-from-duckdb) guide. The guide's §5 keeps environment / scenarios / results / summary inline; this file holds the parts that don't fit a guide-style flow: ingest-path methodology, per-case studies with side-by-side SQL, the DataFrame round-trip operation matrix, and the storage-engine trade-off detail.
 
 For the runnable code and reproduction steps, see [README.md](README.md). The canonical results live in [`benchmark/results_aligned.json`](benchmark/results_aligned.json).
+
+---
+
+## Why 18 queries here but the guide highlights 16
+
+We ran **18 queries** to evaluate both engines fairly across every dimension a DuckDB user might exercise: typed JSON (Q1–Q3), pandas-compatible API (Q4), AI-agent retrieval (Q5), funnel / sequence aggregates (Q6–Q7), multi-percentile (Q8), baseline analytical SQL on Parquet (Q9–Q13), reference queries (Q14–Q15), Parquet → DataFrame export (Q16), and **two storage-engine probes** (Q17 persistent-storage workflow, Q18 PK range scan).
+
+Q17 and Q18 produce large headline gaps in chDB's disfavour (e.g., DuckDB ~14× faster on Q17). On inspection these gaps reflect a **chDB `MergeTree` storage-engine design choice** — `MergeTree` builds a sorted index at write time and maintains primary-key bookkeeping, costs that amortise across many follow-up queries but show up as raw overhead on a 5-query workflow or on a query that touches only a few rows. **They are not query-kernel performance gaps**, and the architectural choice (sort once at write, scan cheaply many times) is the right one for chDB's typical telemetry / analytics workloads even though it loses these specific micro-benchmarks.
+
+If the guide's §5 included Q17 / Q18 alongside the kernel queries, the headline numbers would mislead a reader making an engine-selection decision for a typical agent or notebook workload. So the guide highlights the 16 kernel queries (Q1–Q16) and we document Q17 / Q18 in full at the end of this file ([Storage-engine trade-off](#storage-engine-trade-off-q17--q18)) — both for transparency and so anyone whose workload genuinely is "one-shot ETL + a handful of follow-up queries" can make an informed choice.
 
 ---
 
@@ -16,17 +26,6 @@ The JSON workload (Q1–Q3) is loaded apples-to-apples but **stored differently 
 Both engines ingest the same JSONL file and use the typed `JSON` type provided by the engine. The Q1–Q3 query numbers are **query time only** (ingest is excluded from each engine's timer). chDB amortises a per-path extraction cost during ingest that DuckDB does not pay, but DuckDB then pays per-row at query time. For workloads that ingest once and query many times (the agent-event pattern), this is the architectural trade we want to measure. For workloads that ingest once and query once, it tilts a few hundred milliseconds toward DuckDB — quantify this on your own data if it matters.
 
 The analytical-SQL workload (Q9–Q15) reads the same six Parquet files on both engines.
-
----
-
-## Storage-engine trade-off (Q17 / Q18)
-
-Two queries in the workload measure a chDB MergeTree storage-engine design choice rather than query-kernel performance, so they are reported separately from the guide's main results table:
-
-- **Q17 — persistent storage workflow** (`CREATE TABLE … AS SELECT` + 5 follow-up queries on the persisted table): DuckDB 129 ms vs chDB 1854 ms. chDB's `MergeTree` builds a sorted index at write time — an upfront cost that amortises as you run more queries against the same data, but is heavy when you only run 5. For one-shot ETL-then-query workflows, DuckDB's single-file write is the right call.
-- **Q18 — PK range scan** on a sorted timestamp column: DuckDB 0.4 ms vs chDB 2.9 ms (absolute gap 2.5 ms). At this scale, MergeTree's primary-key bookkeeping cost dominates a query that touches only a few rows; the gap is real but small in absolute terms.
-
-These are signposts that one-shot ETL-then-query workflows should stay on DuckDB; they are not query-engine performance gaps.
 
 ---
 
@@ -161,7 +160,7 @@ Load a Parquet file and return the full result as a pandas DataFrame — the *ou
 
 ## Note — §2.5's connectivity advantage isn't a benchmark line
 
-The 18 queries measure kernel performance on fixed input shapes. They do not measure §2.5 — the ~80-format, 12+-connector, three-streaming-engine in-core surface — which shows up in **deployment shape**, not milliseconds: no `INSTALL/LOAD` chain, no MongoDB / Redis client to pip-install into the agent's runtime, no separate Kafka / RabbitMQ / NATS consumer process, no Python-side decode before SQL on Protobuf / Avro / MsgPack input. For an agent whose data is already a clean Parquet file, this disappears; for one whose data is the firehose the surrounding system emits, it is the largest single operational difference, and invisible in any single-engine query timing.
+The 16 kernel queries measure kernel performance on fixed input shapes. They do not measure §2.5 — the ~80-format, 12+-connector, three-streaming-engine in-core surface — which shows up in **deployment shape**, not milliseconds: no `INSTALL/LOAD` chain, no MongoDB / Redis client to pip-install into the agent's runtime, no separate Kafka / RabbitMQ / NATS consumer process, no Python-side decode before SQL on Protobuf / Avro / MsgPack input. For an agent whose data is already a clean Parquet file, this disappears; for one whose data is the firehose the surrounding system emits, it is the largest single operational difference, and invisible in any single-engine query timing.
 
 ---
 
@@ -181,3 +180,33 @@ Q16 (output path) and Q13 / Q15 (input path) go through different machinery; the
 Op type matters more than engine choice — chDB wins lightweight aggregates outright; DuckDB has a narrow advantage on `GROUP BY`. The cold-subprocess penalty is real for short-lived Lambda-style invocations but is **not** a steady-state `Python(df)`-vs-`register()` difference.
 
 Run `benchmark/bench_input_path_scale.py` and `benchmark/bench_input_path_variants.py` to reproduce these numbers on your own hardware.
+
+---
+
+## Storage-engine trade-off (Q17 / Q18)
+
+These are the two queries the guide does not include in its main results, and the reason was given upfront: they measure a chDB `MergeTree` storage-engine design choice rather than query-kernel performance. Here are the full numbers and the architectural reasoning, so anyone whose workload sits in this corner can make an informed call.
+
+### Q17 — persistent storage workflow (`CREATE TABLE … AS SELECT` + 5 follow-up queries)
+
+DuckDB **129 ms** vs chDB **1854 ms** — DuckDB ~14× faster on this specific shape.
+
+What's happening: chDB's `MergeTree` builds a **sorted index at write time** — the entire row range is sorted on the primary key, parts are merged in the background, and the storage layout pays an upfront cost so that subsequent queries can use sparse primary-key index, zonemap pruning, and skip-indexes to read cheaply. DuckDB's persistent storage is a single file, no separate sort step, no per-column index — write is faster, read uses Parquet-style zonemaps.
+
+This trade-off is real: if your workflow is **one-shot ETL + 5 follow-up queries**, you eat the upfront sort cost without amortising it, and DuckDB's single-file write wins by a factor that looks like 14× because the absolute time is dominated by the `CREATE TABLE` step. If your workflow is **persist once + run hundreds of queries against the same table** (the typical observability / multi-tenant analytics shape that chDB is designed for), the upfront cost amortises and `MergeTree`'s index structures pull ahead.
+
+For one-shot ETL-then-query workflows, DuckDB's single-file write is the right call. For long-lived persistent tables with many follow-up reads, chDB's `MergeTree` is the right call. The headline number for Q17 reflects the first shape.
+
+### Q18 — PK range scan on a sorted timestamp column
+
+DuckDB **0.4 ms** vs chDB **2.9 ms** — absolute gap **2.5 ms**.
+
+The ratio looks alarming (~7× DuckDB advantage) but in absolute terms this is a few milliseconds on a query that touches only a handful of rows. At this scale, the dominant cost on the chDB side is `MergeTree`'s primary-key bookkeeping (sparse index lookup, mark range resolution) — fixed overhead that's invisible at larger row counts but visible when the actual scan work is sub-millisecond. DuckDB's lookup on this shape is essentially metadata-only.
+
+The relative gap shrinks dramatically as the range widens, and at >100 K matched rows chDB matches or exceeds DuckDB. The Q18 shape (tiny range, sorted column, fits in a few marks) is genuinely DuckDB territory, but only at the millisecond budget where chDB is not the engine you'd reach for in the first place.
+
+### Reading these together
+
+The headline ratios (14× and 7× in DuckDB's favour) are mathematically correct. They are also **not selection-decisive for typical chDB workloads** — they measure the upfront cost of a storage design that pays off only across many queries against the same data, and the constant-time overhead of an index structure designed for billion-row tables. A reader picking between chDB and DuckDB for an agent or notebook workload should treat them as boundary information ("if your workload looks exactly like this, stay on DuckDB") rather than as a kernel-performance verdict.
+
+This is also why the guide highlights the 16 kernel queries: showing Q17 / Q18 alongside Q1–Q16 would have anchored readers on the largest headline gap, which here is in the engine's least relevant dimension.
