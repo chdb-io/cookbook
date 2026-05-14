@@ -19,9 +19,9 @@ Use-case-driven (§2.1 → §2.7), then baseline analytical SQL, then reference 
   --- reference queries ---
   Q14 topK pickup zones
   Q15 DataFrame round-trip (wide, 19 cols)
-  Q16 persistent storage workflow (load + 5 queries)
-  Q17 primary-key range scan
-  Q18 Parquet → DataFrame export (single file, full materialisation)
+  Q16 Parquet → DataFrame export (single file, full materialisation)
+  Q17 persistent storage workflow (load + 5 queries, storage-engine probe)
+  Q18 primary-key range scan (storage-engine probe)
 """
 
 import json, os, time
@@ -190,7 +190,13 @@ def main():
         GROUP BY VendorID ORDER BY trips DESC
     """, "DataFrame")))
 
-    def q16():
+    results.append(measure("Q16 Parquet → DataFrame export", lambda: sess.query(f"""
+        SELECT * FROM file('{TAXI_SINGLE}', 'Parquet')
+    """, "DataFrame")))
+
+    # Q17 / Q18 are storage-engine probes (chDB MergeTree upfront sort + index cost).
+    # Reported separately from the kernel benchmark in BENCHMARK.md.
+    def q17():
         sess.query("DROP TABLE IF EXISTS trips_perf_test")
         sess.query(f"""
             CREATE TABLE trips_perf_test
@@ -208,16 +214,12 @@ def main():
             sess.query("SELECT toStartOfDay(tpep_pickup_datetime) d, count(*) FROM trips_perf_test GROUP BY d ORDER BY d LIMIT 10", "CSV"),
             sess.query("SELECT count(*) FROM trips_perf_test WHERE total_amount > 100", "CSV"),
         ]
-    results.append(measure("Q16 persistent storage (load+5q)", q16))
+    results.append(measure("Q17 persistent storage (load+5q)", q17))
 
-    results.append(measure("Q17 PK range scan", lambda: sess.query("""
+    results.append(measure("Q18 PK range scan", lambda: sess.query("""
         SELECT count(*), avg(fare_amount), avg(tip_amount)
         FROM trips_perf_test
         WHERE tpep_pickup_datetime BETWEEN '2024-03-15 16:00:00' AND '2024-03-15 20:00:00'
-    """, "DataFrame")))
-
-    results.append(measure("Q18 Parquet → DataFrame export", lambda: sess.query(f"""
-        SELECT * FROM file('{TAXI_SINGLE}', 'Parquet')
     """, "DataFrame")))
 
     print("\n__RESULTS_JSON__", json.dumps({

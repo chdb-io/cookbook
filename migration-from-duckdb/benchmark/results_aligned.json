@@ -100,22 +100,22 @@
       "speedup": 0.6021590920920753
     },
     {
-      "name": "Q16 persistent storage (load+5q)",
+      "name": "Q16 Parquet → DataFrame export",
+      "duckdb_ms": 391.70862500000015,
+      "chdb_ms": 243.88741599999975,
+      "speedup": 1.6061042895300532
+    },
+    {
+      "name": "Q17 persistent storage (load+5q)",
       "duckdb_ms": 129.23499999999976,
       "chdb_ms": 1854.2040000000002,
       "speedup": 0.06969837191592713
     },
     {
-      "name": "Q17 PK range scan",
+      "name": "Q18 PK range scan",
       "duckdb_ms": 0.3965000000003549,
       "chdb_ms": 2.890916000000132,
       "speedup": 0.13715376026156995
-    },
-    {
-      "name": "Q18 Parquet \u2192 DataFrame export",
-      "duckdb_ms": 391.70862500000015,
-      "chdb_ms": 243.88741599999975,
-      "speedup": 1.6061042895300532
     }
   ]
 }

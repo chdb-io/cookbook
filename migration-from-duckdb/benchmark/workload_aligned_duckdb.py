@@ -11,9 +11,9 @@ Mirror of workload_aligned_chdb.py, using DuckDB-native idioms.
   Q9-Q13 baseline analytical SQL
   Q14    GROUP BY + ORDER + LIMIT (exact, vs chDB's approximate topK)
   Q15    wide DataFrame round-trip
-  Q16    CREATE TABLE AS + 5 queries
-  Q17    range scan on indexed table
-  Q18    single-file Parquet → DataFrame export
+  Q16    single-file Parquet → DataFrame export
+  Q17    CREATE TABLE AS + 5 queries (storage-engine probe)
+  Q18    range scan on indexed table (storage-engine probe)
 """
 
 import json, os, time
@@ -205,7 +205,13 @@ def main():
         """).df()
     results.append(measure("Q15 DataFrame roundtrip (wide, 19 cols)", q15))
 
-    def q16():
+    results.append(measure("Q16 Parquet → DataFrame export", lambda:
+        con.execute(f"SELECT * FROM read_parquet('{TAXI_SINGLE}')").df()
+    ))
+
+    # Q17 / Q18 are storage-engine probes (chDB MergeTree upfront sort + index cost).
+    # They are reported separately from the kernel benchmark in BENCHMARK.md.
+    def q17():
         con.execute("DROP TABLE IF EXISTS trips_perf_test")
         con.execute(f"""
             CREATE TABLE trips_perf_test AS
@@ -220,17 +226,13 @@ def main():
             con.execute("SELECT date_trunc('day', tpep_pickup_datetime) d, count(*) FROM trips_perf_test GROUP BY d ORDER BY d LIMIT 10").fetchall(),
             con.execute("SELECT count(*) FROM trips_perf_test WHERE total_amount > 100").fetchall(),
         ]
-    results.append(measure("Q16 persistent storage (load+5q)", q16))
+    results.append(measure("Q17 persistent storage (load+5q)", q17))
 
-    results.append(measure("Q17 PK range scan", lambda: con.execute("""
+    results.append(measure("Q18 PK range scan", lambda: con.execute("""
         SELECT count(*), avg(fare_amount), avg(tip_amount)
         FROM trips_perf_test
         WHERE tpep_pickup_datetime BETWEEN '2024-03-15 16:00:00' AND '2024-03-15 20:00:00'
     """).fetchall()))
-
-    results.append(measure("Q18 Parquet → DataFrame export", lambda:
-        con.execute(f"SELECT * FROM read_parquet('{TAXI_SINGLE}')").df()
-    ))
 
     print("\n__RESULTS_JSON__", json.dumps({
         "engine": "duckdb", "version": duckdb.__version__, "queries": results,

@@ -19,12 +19,12 @@ The analytical-SQL workload (Q9–Q15) reads the same six Parquet files on both 
 
 ---
 
-## Storage-engine trade-off (Q16 / Q17)
+## Storage-engine trade-off (Q17 / Q18)
 
-Two queries in the original workload measure a chDB MergeTree storage-engine design choice rather than query-kernel performance, so they are reported separately from the guide's main results table:
+Two queries in the workload measure a chDB MergeTree storage-engine design choice rather than query-kernel performance, so they are reported separately from the guide's main results table:
 
-- **Q16 — persistent storage workflow** (`CREATE TABLE … AS SELECT` + 5 follow-up queries on the persisted table): DuckDB 129 ms vs chDB 1854 ms. chDB's `MergeTree` builds a sorted index at write time — an upfront cost that amortises as you run more queries against the same data, but is heavy when you only run 5. For one-shot ETL-then-query workflows, DuckDB's single-file write is the right call.
-- **Q17 — PK range scan** on a sorted timestamp column: DuckDB 0.4 ms vs chDB 2.9 ms (absolute gap 2.5 ms). At this scale, MergeTree's primary-key bookkeeping cost dominates a query that touches only a few rows; the gap is real but small in absolute terms.
+- **Q17 — persistent storage workflow** (`CREATE TABLE … AS SELECT` + 5 follow-up queries on the persisted table): DuckDB 129 ms vs chDB 1854 ms. chDB's `MergeTree` builds a sorted index at write time — an upfront cost that amortises as you run more queries against the same data, but is heavy when you only run 5. For one-shot ETL-then-query workflows, DuckDB's single-file write is the right call.
+- **Q18 — PK range scan** on a sorted timestamp column: DuckDB 0.4 ms vs chDB 2.9 ms (absolute gap 2.5 ms). At this scale, MergeTree's primary-key bookkeeping cost dominates a query that touches only a few rows; the gap is real but small in absolute terms.
 
 These are signposts that one-shot ETL-then-query workflows should stay on DuckDB; they are not query-engine performance gaps.
 
@@ -151,11 +151,11 @@ Both queries produce one array `[p50, p95, p99]` from a single TDigest sketch ov
 
 The chDB family is also wider — `quantilesExact`, `quantilesGK`, `quantilesBFloat16Weighted` — when you need a different precision / memory trade-off than TDigest, the API shape stays identical.
 
-### Case G — Parquet → DataFrame export: zero-copy materialisation (Q18, 1.61× faster cold / 2.99× warm)
+### Case G — Parquet → DataFrame export: zero-copy materialisation (Q16, 1.61× faster cold / 2.99× warm)
 
 Load a Parquet file and return the full result as a pandas DataFrame — the *output* path. This is the operation behind chDB's published "24% faster than DuckDB on DataFrame export" claim from the [zero-copy blog](https://clickhouse.com/blog/chdb-journey-to-zero-copy) (January 2026, ClickBench hits, 1 M rows). On our 3 M-row × 19-col NYC TLC file: cold 392 ms → 244 ms (1.61×, 38 % reduction); warm 325 ms → 108 ms (2.99×, 67 %). Both meet or exceed the blog. Mechanism: chDB's `__arrow_c_stream__` zero-copy SIMD path materialises columns directly into NumPy with no intermediate Arrow → pandas copy.
 
-**Important — not the same as `Python(df)`.** Q18 is the **output** path. Q13 / Q15's `Python(df)` table function is the **input** path (existing pandas DataFrame → SQL → DataFrame) and goes through different machinery. Performance there is operation-dependent — see "DataFrame round-trip — input depends on the operation" below.
+**Important — not the same as `Python(df)`.** Q16 is the **output** path. Q13 / Q15's `Python(df)` table function is the **input** path (existing pandas DataFrame → SQL → DataFrame) and goes through different machinery. Performance there is operation-dependent — see "DataFrame round-trip — input depends on the operation" below.
 
 ---
 
@@ -167,11 +167,11 @@ The 18 queries measure kernel performance on fixed input shapes. They do not mea
 
 ## DataFrame round-trip — input depends on the operation
 
-Q18 (output path) and Q13 / Q15 (input path) go through different machinery; the input-path result is operation-dependent, not a flat win for either engine:
+Q16 (output path) and Q13 / Q15 (input path) go through different machinery; the input-path result is operation-dependent, not a flat win for either engine:
 
 | Path | Operation | Result |
 |---|---|---|
-| Output — Parquet → DataFrame (Q18) | full file export | **chDB 1.61× cold, 2.99× warm** |
+| Output — Parquet → DataFrame (Q16) | full file export | **chDB 1.61× cold, 2.99× warm** |
 | Input, warm in-process, 10 M rows | `COUNT(*)` | **chDB 1.4×** |
 | Input, warm in-process, 10 M rows | filter + `COUNT` | **chDB 1.1×** |
 | Input, warm in-process, 10 M rows | `COUNT(*)` on wide (60-col) DF | **chDB 2.1×** |
