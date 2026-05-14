@@ -7,7 +7,7 @@ Mirror of workload_aligned_chdb.py, using DuckDB-native idioms.
   Q5     vector cosine via `array_cosine_distance(...)::FLOAT[384]`
   Q6     funnel via LAG CTE
   Q7     sequence pattern via LAG CTE
-  Q8     three separate `approx_quantile()` calls
+  Q8     approx_quantile list-form (single sketch)
   Q9-Q13 baseline analytical SQL
   Q14    GROUP BY + ORDER + LIMIT (exact, vs chDB's approximate topK)
   Q15    wide DataFrame round-trip
@@ -142,11 +142,12 @@ def main():
         WHERE step = 3 AND prev1 = 2 AND prev2 = 1
     """).fetchall()))
 
-    # ---------- §2.7 Many percentiles ----------
-    results.append(measure("Q8 approx_quantile × 3 (p50/p95/p99)", lambda: con.execute(f"""
-        SELECT approx_quantile(fare_amount, 0.5)  AS p50,
-               approx_quantile(fare_amount, 0.95) AS p95,
-               approx_quantile(fare_amount, 0.99) AS p99
+    # ---------- §2.9 Many percentiles ----------
+    # DuckDB supports a list form `approx_quantile(x, [0.5, 0.95, 0.99])` that
+    # produces a single TDigest sketch — apples-to-apples with chDB's
+    # quantilesTDigest(0.5, 0.95, 0.99)(x).
+    results.append(measure("Q8 approx_quantile list-form p50/p95/p99", lambda: con.execute(f"""
+        SELECT approx_quantile(fare_amount, [0.5, 0.95, 0.99]) AS pcts
         FROM read_parquet('{TAXI_GLOB}') WHERE fare_amount > 0
     """).fetchall()))
 
