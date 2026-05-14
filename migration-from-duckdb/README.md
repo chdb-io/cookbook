@@ -4,11 +4,16 @@ Runnable companion to the [Migrating from DuckDB to chDB](https://clickhouse.com
 guide. The prose lives at the docs site; this directory holds the static
 migration analyzer and the 18-query benchmark referenced from §5 of the guide.
 
+For the methodology deep dive (ingest-path notes, storage-engine trade-off
+analysis, per-case studies with side-by-side SQL, DataFrame round-trip matrix),
+see [BENCHMARK.md](BENCHMARK.md).
+
 ## What's here
 
 ```
 migration-from-duckdb/
 ├── README.md                      # this file
+├── BENCHMARK.md                   # ingest-path methodology, storage trade-off, Cases A-G with SQL, round-trip detail
 ├── migrate.py                     # static DuckDB→chDB API analyzer
 └── benchmark/
     ├── workload_aligned_duckdb.py # 18-query DuckDB workload
