@@ -24,6 +24,11 @@ Every notebook runs end-to-end with `pip install chdb` and the dependencies list
 - Each notebook has a 1-paragraph "What you'll learn" header and a "Try next" footer.
 - File names use kebab-case; categories use lowercase singular nouns.
 
+## Cookbooks
+
+### agents
+- [Federated SQL for Claude Dynamic Workflows](dynamic-workflows/README.md) — give every subagent an in-process engine that joins S3, Postgres, ClickHouse, an HTTP API, and a DataFrame in one query.
+
 ## Contributing
 
 PRs welcome. To propose a notebook:
