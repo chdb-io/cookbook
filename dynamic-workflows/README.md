@@ -4,6 +4,8 @@
 
 **What you'll learn:** how to make each subagent in a Claude Dynamic Workflow a federated chDB query that joins S3, Postgres, ClickHouse, an HTTP API, and an in-memory DataFrame in one statement, with no server to stand up.
 
+> Prefer a styled read? Open [`cookbook.html`](cookbook.html) locally, or view it rendered via [htmlpreview](https://htmlpreview.github.io/?https://raw.githubusercontent.com/chdb-io/cookbook/main/dynamic-workflows/cookbook.html). The Markdown below is the same content with GitHub-native diagrams.
+
 ---
 
 ## 1. What Dynamic Workflows actually does
