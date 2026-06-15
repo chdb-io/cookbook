@@ -1,0 +1,14 @@
+{
+  "name": "otel-ingestion-buffer",
+  "private": true,
+  "type": "module",
+  "description": "chDB as an off-heap OTEL ingestion buffer in a Node.js service",
+  "scripts": {
+    "scenario:1": "node scenario-1-ingest-join.mjs",
+    "scenario:2": "node scenario-2-flow-control.mjs",
+    "scenario:3": "node scenario-3-error-retry.mjs"
+  },
+  "dependencies": {
+    "chdb": "3.1.0-rc.2"
+  }
+}
