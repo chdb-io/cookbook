@@ -1,124 +1,142 @@
-// Shared helpers for the three OTEL-ingestion-buffer scenarios.
+// Shared scaffolding for the OTEL ingestion cookbook.
 //
-// Each scenario file (scenario-1/2/3) is meant to be read and run on its own;
-// this module holds only the boilerplate they all need — the buffer schema, a
-// byte-level field peek, and a synthetic Langfuse-style span generator — so the
-// scenario files can stay focused on the one thing they teach.
+// The design (see ../langfuse_chdb_final_design_en.md): the payload already sits
+// on S3 as length-delimited protobuf, keyed by entity
+// (s3://…/{projectId}/observation/{eventBodyId}/*.pb). Per entity, JavaScript
+// only hands chDB a glob path; ONE SQL statement reads + parses the protobuf,
+// field-merges the create/update partial events (argMaxIf … GROUP BY id),
+// enriches via dictGet (prompt/price) + match() (model) + a token UDF, and
+// exports — no row data, no JSON.parse, no field-merge in JavaScript.
+//
+// Demo substitutions (production form in comments at each call site):
+//   • file('…/*.pb','Protobuf')        → s3('s3://…/*.pb','Protobuf')
+//   • bpe_count SQL placeholder        → CREATE FUNCTION bpe_count LANGUAGE WASM …
+//   • dict SOURCE(CLICKHOUSE(TABLE …)) → SOURCE(POSTGRESQL(…))
+//   • INSERT INTO events_priced (local)→ INSERT INTO FUNCTION remoteSecure(…)
 
-// ---------------------------------------------------------------------------
-// Schema: a Null table as the ingest funnel + a materialized view that enriches
-// in engine threads. The Null table stores nothing; inserting into it only
-// triggers the view, which extracts/computes/truncates without JS ever parsing
-// the payload. ns timestamps are stored as UInt64 (they arrive as JSON strings,
-// so the full uint64 survives — JS number would lose precision past 2^53).
-// ---------------------------------------------------------------------------
-export function createSchema(session) {
-  session.query(`
-    CREATE TABLE IF NOT EXISTS otel_raw (
-      trace_id   String,
-      span_id    String,
-      start_ns   UInt64,
-      end_ns     UInt64,
-      name       String,
-      attributes String
-    ) ENGINE = Null`)
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import protobuf from 'protobufjs'
 
-  session.query(`
-    CREATE TABLE IF NOT EXISTS events (
-      trace_id      String,
-      span_id       String,
-      start_ns      UInt64,
-      duration_ms   Float64,
-      name          String,
-      model         String,
-      input_tokens  UInt64,
-      output_tokens UInt64,
-      prompt_preview String,
-      tenant        LowCardinality(String),
-      received_at   DateTime64(9) DEFAULT now64(9)
-    ) ENGINE = MergeTree ORDER BY (tenant, trace_id, span_id)`)
+const here = dirname(fileURLToPath(import.meta.url))
+export const PROTO = join(here, 'observation.proto')
+export const PREFIX = 'events'
+export const PROJECT = 'proj_demo'
 
-  session.query(`
-    CREATE MATERIALIZED VIEW IF NOT EXISTS mv_events TO events AS
-    SELECT
-      trace_id, span_id, start_ns,
-      (end_ns - start_ns) / 1e6                                       AS duration_ms,
-      name,
-      JSONExtractString(attributes, 'gen_ai.request.model')          AS model,
-      JSONExtractUInt(attributes, 'gen_ai.usage.input_tokens')       AS input_tokens,
-      JSONExtractUInt(attributes, 'gen_ai.usage.output_tokens')      AS output_tokens,
-      leftUTF8(JSONExtractString(attributes, 'gen_ai.prompt'), 80)   AS prompt_preview,
-      JSONExtractString(attributes, 'tenant.id')                     AS tenant
-    FROM otel_raw`)
+// keepCase:true so JS field names stay snake_case (match the .proto and what the
+// engine maps); otherwise protobufjs camelCases project_id → projectId and
+// silently drops snake_case values.
+const { root } = protobuf.parse(readFileSync(PROTO, 'utf8'), { keepCase: true })
+export const Obs = root.lookupType('Observation')
+
+// Write one length-delimited protobuf event under the entity prefix.
+// encodeDelimited = varint length prefix + message == ClickHouse `Protobuf` framing.
+export function writeEvent(dataDir, eventBodyId, eventId, fields) {
+  const dir = join(dataDir, PREFIX, PROJECT, 'observation', eventBodyId)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, `${eventId}.pb`), Obs.encodeDelimited(Obs.create(fields)).finish())
 }
 
-// ---------------------------------------------------------------------------
-// Lightweight byte-level field peek — the "SAX" lane. When the service itself
-// needs one small field (tenant routing, a sampling/quota key), scan the bytes
-// for it instead of materializing the batch as JS objects. No object tree, early
-// exit on the first hit; for a single-tenant batch that is O(1) per request.
-//
-// Handles both a top-level `"key":"value"` and the escaped `\"key\":\"value\"`
-// form you get when the field lives inside a JSON-encoded string column (as OTEL
-// attributes usually do). For deeply nested / per-line extraction at scale, swap
-// this for a streaming SAX parser (stream-json, clarinet); the principle is the
-// same — materialize only the fields you filter for.
-// ---------------------------------------------------------------------------
-export function peekField(buf, key) {
-  let needle = Buffer.from(`"${key}":"`)
-  let i = buf.indexOf(needle)
-  if (i >= 0) {
-    const start = i + needle.length
-    let end = start
-    while (end < buf.length && buf[end] !== 0x22 /* " */) {
-      if (buf[end] === 0x5c /* \ */) end++ // skip the escaped pair
-      end++
-    }
-    return buf.toString('utf8', start, end)
-  }
-  needle = Buffer.from(`\\"${key}\\":\\"`)
-  i = buf.indexOf(needle)
-  if (i < 0) return undefined
-  const start = i + needle.length
-  let end = start
-  while (end < buf.length) {
-    if (buf[end] === 0x5c /* \ */) {
-      if (buf[end + 1] === 0x22 /* " */) break // \" closes the nested string
-      end += 2
-    } else end++
-  }
-  return buf.toString('utf8', start, end)
-}
-
-// ---------------------------------------------------------------------------
-// Synthetic Langfuse-style LLM span: wide attributes with the full prompt
-// inline, ns-precision timestamps carried as strings so the uint64 survives.
-// ---------------------------------------------------------------------------
-const PROMPT = 'Explain the difference between columnar and row-oriented storage, with examples. '.repeat(20)
-const MODELS = ['gpt-4o', 'claude-fable-5']
-
-export function span(i, tenant) {
-  const startNs = 1780000000000000000n + BigInt(i) * 1000000n
-  return JSON.stringify({
-    trace_id: `trace-${String(i).padStart(6, '0')}`,
-    span_id: `span-${String(i).padStart(6, '0')}`,
-    start_ns: String(startNs),
-    end_ns: String(startNs + BigInt(50_000_000 + (i % 7) * 10_000_000)),
-    name: 'llm.call',
-    attributes: JSON.stringify({
-      'gen_ai.request.model': MODELS[i % MODELS.length],
-      'gen_ai.prompt': PROMPT,
-      'gen_ai.usage.input_tokens': 420 + (i % 1000),
-      'gen_ai.usage.output_tokens': 120 + (i % 500),
-      'tenant.id': tenant,
-    }),
+// Seed an observation as a create event (input/model/prompt) then, if it has
+// output, an update event carrying ONLY output at a later ts — i.e. partial
+// deltas, exactly like the SDK protocol (create then update).
+export function seedEntity(dataDir, e) {
+  writeEvent(dataDir, e.id, 'evt-create', {
+    id: e.id, ts: e.ts ?? 1000, project_id: PROJECT, trace_id: `trace_${e.id}`,
+    input: e.input, model: e.model, prompt_name: e.prompt[0], prompt_version: e.prompt[1],
   })
+  if (e.output) writeEvent(dataDir, e.id, 'evt-update', { id: e.id, ts: (e.ts ?? 1000) + 5, output: e.output })
 }
 
-// A lazy generator of NDJSON span lines (one span per line, '\n' = row
-// boundary). Feed it to Readable.from() — as an HTTP request body or as a
-// streaming insert source — so the batch is produced on demand and never
-// assembled in memory.
-export function* spanLines(from, to, tenant) {
-  for (let i = from; i < to; i++) yield span(i, tenant) + '\n'
+// The glob for one entity's files. Production: s3('s3://bucket/…/{eventBodyId}/*.pb').
+export function entityGlob(dataDir, eventBodyId) {
+  return join(dataDir, PREFIX, PROJECT, 'observation', eventBodyId, '*.pb')
+}
+
+// Engine-side scaffolding: destination table, reference dictionaries, token UDF.
+// destEngine lets a scenario pick ReplacingMergeTree (full rows) vs other engines.
+export function setupEngine(session, { destEngine = 'ReplacingMergeTree(event_ts)' } = {}) {
+  // Destination. Production: remoteSecure(...) into CH Cloud, where the
+  // cross-chunk / cross-time merge is the destination engine's job:
+  //   full rows → ReplacingMergeTree(event_ts);  partial → AggregatingMergeTree + argMaxIf
+  session.query(`
+    CREATE TABLE events_priced (
+      id String, project_id String, trace_id String, model String,
+      prompt_id String, model_id String,
+      input_tokens UInt64, output_tokens UInt64, total_cost Float64,
+      event_ts UInt64
+    ) ENGINE = ${destEngine} ORDER BY (project_id, id)`)
+
+  // Reference data. Production: dictionaries are SOURCE(POSTGRESQL(...)), refreshed
+  // by LIFETIME — never queried per row, and they REPLACE Redis on this path
+  // (the dict is the cache over PG, the source of truth). Freshness:
+  //   prompt → complex_key_cache (read-through; a new version resolves on miss)
+  //   model/price → hashed + LIFETIME (slow-changing, periodic refresh)
+  session.query(`CREATE TABLE prompt_src (project_id String, prompt_name String, prompt_version UInt32, id String) ENGINE=MergeTree ORDER BY (project_id, prompt_name, prompt_version)`)
+  session.query(`INSERT INTO prompt_src VALUES
+    ('${PROJECT}','summarize',3,'prompt_sum_v3'),
+    ('${PROJECT}','classify',1,'prompt_cls_v1'),
+    ('${PROJECT}','extract',2,'prompt_ext_v2')`)
+  session.query(`
+    CREATE DICTIONARY prompt_dict (project_id String, prompt_name String, prompt_version UInt32, id String)
+    PRIMARY KEY project_id, prompt_name, prompt_version
+    SOURCE(CLICKHOUSE(TABLE 'prompt_src'))     -- prod: SOURCE(POSTGRESQL(host … table 'prompts'))
+    LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 100000)) LIFETIME(MIN 30 MAX 60)`)
+
+  // model resolution = regex match on the provided model name → internal id + tokenizer
+  // (regexp_tree dictionary is the optimized form; a small table + match() is the simple equivalent)
+  session.query(`CREATE TABLE models (pattern String, model_id String, tokenizer String) ENGINE=MergeTree ORDER BY pattern`)
+  session.query(`INSERT INTO models VALUES ('^gpt-4o','m_gpt4o','o200k_base'), ('^claude','m_claude','claude_bpe')`)
+
+  session.query(`CREATE TABLE price_src (model_id String, in_micro UInt64, out_micro UInt64) ENGINE=MergeTree ORDER BY model_id`)
+  // micro-USD per 1M tokens
+  session.query(`INSERT INTO price_src VALUES ('m_gpt4o',2500000,10000000), ('m_claude',3000000,15000000)`)
+  session.query(`
+    CREATE DICTIONARY price_dict (model_id String, in_micro UInt64, out_micro UInt64)
+    PRIMARY KEY model_id
+    SOURCE(CLICKHOUSE(TABLE 'price_src'))       -- prod: SOURCE(POSTGRESQL(… table 'pricing'))
+    LAYOUT(COMPLEX_KEY_HASHED()) LIFETIME(MIN 30 MAX 60)`)
+
+  // Token count. PLACEHOLDER (length/4). Production: a WASM UDF (tiktoken-rs → wasm,
+  // vocab embedded) — runs as parallel engine instances, off JS. Requires chdb-core
+  // to enable the upstream WASM-UDF runtime (today: SUPPORT_IS_DISABLED).
+  //   CREATE FUNCTION bpe_count LANGUAGE WASM ARGUMENTS (text String, tokenizer String)
+  //     RETURNS UInt64 FROM 'tiktoken.wasm' SHA256_HASH '…';
+  session.query(`CREATE FUNCTION bpe_count AS (text, tokenizer) -> toUInt64(length(text) / 4 + 1)`)
+}
+
+// The canonical per-entity statement: glob → field-merge → enrich → export.
+// This is THE pipeline; every scenario uses it. Production swaps file()→s3() and
+// the target → FUNCTION remoteSecure(...). `extraSettings` appends to SETTINGS.
+export function entityInsertSQL(glob, { target = 'events_priced', extraSettings = '' } = {}) {
+  const settings = `format_schema = '${PROTO}:Observation'` + (extraSettings ? `, ${extraSettings}` : '')
+  return `
+    INSERT INTO ${target}
+    WITH merged AS (
+      SELECT
+        id,
+        argMaxIf(project_id,     ts, project_id     != '') AS project_id,
+        argMaxIf(trace_id,       ts, trace_id       != '') AS trace_id,
+        argMaxIf(input,          ts, input          != '') AS input,
+        argMaxIf(output,         ts, output         != '') AS output,
+        argMaxIf(model,          ts, model          != '') AS model,
+        argMaxIf(prompt_name,    ts, prompt_name    != '') AS prompt_name,
+        argMaxIf(prompt_version, ts, prompt_version != 0)  AS prompt_version,
+        max(ts) AS event_ts
+      FROM file('${glob}', 'Protobuf')          -- prod: s3('s3://…/*.pb','Protobuf')
+      GROUP BY id                               -- merge ALL fields by id (create+update are disjoint)
+    )
+    SELECT
+      m.id, m.project_id, m.trace_id, m.model,
+      dictGet('prompt_dict', 'id', (m.project_id, m.prompt_name, m.prompt_version))   AS prompt_id,
+      md.model_id                                                                     AS model_id,
+      bpe_count(m.input,  md.tokenizer)                                               AS input_tokens,
+      bpe_count(m.output, md.tokenizer)                                               AS output_tokens,
+      input_tokens  * dictGet('price_dict','in_micro',  tuple(md.model_id)) / 1e6
+        + output_tokens * dictGet('price_dict','out_micro', tuple(md.model_id)) / 1e6 AS total_cost,
+      m.event_ts
+    FROM merged AS m, models AS md              -- model regex match (prod: regexp_tree dict)
+    WHERE match(m.model, md.pattern)
+    SETTINGS ${settings}`
 }

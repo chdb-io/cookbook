@@ -1,265 +1,132 @@
-# OTEL ingestion buffer in Node.js
+# OTEL ingestion buffer in Node.js — S3 → ClickHouse with chDB
 
-Use chDB as an off-heap ingestion buffer inside a Node.js service that receives
-OTEL/LLM-trace JSON — the Langfuse-style workload: wide span attributes carrying
-full prompts and completions, nanosecond timestamps. The body bytes are handed
-to the engine without ever calling `JSON.parse` on the main thread, rows are
-enriched inside the engine with a materialized view, and the buffer is exported
-to a ClickHouse server over the native protocol — without the data ever
-surfacing back into JavaScript.
+Move OTEL/LLM-trace data from S3 into ClickHouse from a Node.js service **without
+the rows ever passing through JavaScript** — the Langfuse-style "data is already
+on S3" workload. The payload sits on S3 as **length-delimited protobuf**, keyed by
+entity (`s3://…/{projectId}/observation/{eventBodyId}/*.pb`). Per entity, Node
+hands chDB a glob path and nothing else; **one SQL statement** reads + parses the
+protobuf, field-merges the create/update partial events, enriches (prompt/model/
+price lookups + token counting), and exports to a ClickHouse server over the
+native protocol. JavaScript never calls `JSON.parse`, never merges rows, never
+touches a socket.
 
-> **Requires** the raw/streaming insert API — `insert({ values: Buffer | Readable, format })` — which ships in the **`chdb@3.1.0-rc.2`** prerelease (chdb-node on the chdb-core v26.5.1-rc.1 engine). Node 20+.
+> Design of record: [`../langfuse_chdb_final_design_en.md`](../langfuse_chdb_final_design_en.md). Everything here follows it.
+
+> **Requires** `chdb@3.1.0-rc.2` (chdb-node on the chdb-core v26.5.1-rc.1 engine), Node 20+, and `protobufjs` (to generate the sample `.pb`). The scenarios run end to end against embedded chDB.
 >
 > ```bash
-> npm install chdb@3.1.0-rc.2   # or: npm install chdb@next
+> npm install
 > ```
->
-> The stable `chdb@3.0.0` (chdb-core v26.5.0) does **not** include this API — install the prerelease above to run these scenarios.
 
-## Why a buffer, and why not `JSON.parse`
+## Why pull-from-S3, and why no `JSON.parse`
 
-A Node ingestion service that handles large JSON the usual way hits four walls:
+A Node service that moves large JSON through the JS data plane hits four walls:
 
-1. `JSON.parse`/`JSON.stringify` are synchronous and uninterruptible — a big batch freezes the event loop exactly when the service is busiest.
-2. V8 caps a single string at ~512 MB — accumulating batches into strings eventually throws `RangeError`.
-3. JS `number` loses precision past 2^53 — nanosecond timestamps (~1.8 × 10^18) silently corrupt.
-4. Writing to upstream sockets from JS means buffering, backpressure bookkeeping, and GC pressure.
+1. **Event-loop freeze** — `JSON.parse`/`JSON.stringify` are synchronous and uninterruptible; a big batch freezes the loop exactly when the service is busiest.
+2. **String ceiling** — V8 caps a single string at ~512 MB; accumulating batches into one string eventually throws `RangeError`.
+3. **Integer precision** — JS `number` loses precision past 2^53, so nanosecond timestamps (~1.8 × 10^18) silently corrupt unless carried as strings.
+4. **Socket backpressure** — writing to upstream sockets from JS means manual buffering, backpressure bookkeeping, and GC pressure, which feeds back into wall 1.
 
-chDB removes all four by keeping the payload a `Buffer` (off the V8 heap) and
-letting the engine — a multithreaded C++ parser — do every byte of parsing, then
-having the engine push to the server from its own threads. JavaScript's job is to
-pass a reference. chDB here is closest to an **embedded OTel-collector / Vector
-buffer whose buffer-and-transform stage is a full ClickHouse SQL engine**: it
-receives, absorbs bursts, transforms in SQL, and ships over the native protocol —
-the socket never lands on your event loop.
-
-Two lanes feed the buffer; they merge engine-side at export:
+Same disease, four symptoms: the data has to become V8-heap objects/strings on the main thread, and the socket has to be driven from the event loop. chDB removes the whole data plane from JS — the engine reads S3, parses, merges, enriches, and ships from its own C++ threads — so all four stop existing rather than being mitigated.
 
 ```
-Lane 1 — hot path (spans):
-  HTTP NDJSON body ──(Buffer, zero-copy)──▶ insert() ──▶ otel_raw (Null) ──MV──▶ events (MergeTree)
-       └ peekField(first chunk) → tenant routing   (byte-level SAX scan, no JSON.parse)
-
-Lane 2 — reference data (prices):
-  model prices (JS bigint, decimal text → lossless UInt64) ──object insert──▶ model_prices
-
-Merge & ship (engine-side, at export):
-  events  JOIN model_prices ON `model`  ──▶  INSERT INTO FUNCTION remoteSecure(...) SELECT  ──▶  remote ClickHouse
+  S3 (length-delimited protobuf, by entity)
+       │   per entity, JS passes only a glob path  's3://…/{eventBodyId}/*.pb'
+       ▼
+  chDB (embedded, in the Node process) — ONE statement:
+       s3('…/{eventBodyId}/*.pb','Protobuf')           read + parse protobuf       [engine, multi-thread]
+        │  GROUP BY id, argMaxIf(col, ts, col<>'')      field-merge create+update   [engine]
+        ▼
+       dictGet(prompt) + match(model) + dictGet(price)  enrich (lookups ← Postgres) [engine]
+        │  bpe_count(text, tokenizer)                   token count                 [engine; WASM UDF]
+        ▼
+       INSERT INTO FUNCTION remoteSecure(...)           export                      [engine, native protocol]
+       ▼
+  ClickHouse Cloud — ReplacingMergeTree / AggregatingMergeTree (cross-chunk merge backstop)
 ```
 
-The hot lane never assembles the body or calls `JSON.parse`; it streams the bytes
-straight in and, where the service needs one small field (tenant routing, a
-sampling key), reads it with a byte-level scan of the first chunk — no object
-tree. The reference lane keeps prices out of the high-traffic stream: they live in
-a small table and are JOINed on the `model` key at export. Nanosecond timestamps
-ride as JSON strings and land in `UInt64` exactly; prices are born as `bigint` and
-serialize to decimal text, so neither hits the 2^53 cliff.
+The field-merge (`argMaxIf … GROUP BY id`) collapses the create event (which carries `input`/`model`/`prompt`) and the later update event (which carries only `output`) into one full row — **replacing the app-side read-modify-write** entirely. Nanosecond integers stay in `UInt64` exactly; nothing ever becomes a V8 number or string.
 
 ## Scenarios
 
-Three runnable demos, each self-contained. The shared schema and helpers (the
-`Null` + materialized-view funnel, the byte-level field peek, a synthetic span
-generator) live in [`_shared.mjs`](./_shared.mjs).
+Three runnable demos. The shared scaffolding — the protobuf generator, the
+reference dictionaries + token UDF, and the one canonical per-entity SQL — lives
+in [`_shared.mjs`](./_shared.mjs); the schema is [`observation.proto`](./observation.proto).
 
 ```bash
-npm install          # links chdb
-npm run scenario:1   # the core pipeline
-npm run scenario:2   # flow control
+npm install
+npm run scenario:1   # the core pipeline (S3 protobuf → merge → enrich → export)
+npm run scenario:2   # flow & resource control
 npm run scenario:3   # failures & retries
 ```
 
-- **[Scenario 1 — the core pipeline](./scenario-1-ingest-join.mjs)** — the shape above, end to end: streamed NDJSON ingest with a byte-level tenant peek, plus `bigint` model-price reference data joined engine-side at export. Proves the `bigint` round-trips losslessly (decimal text → `UInt64`) and that prices never enter the hot byte stream.
-- **[Scenario 2 — flow control](./scenario-2-flow-control.mjs)** — bounded memory (O(chunk), not O(body)) and end-to-end backpressure, plus the three typed flow-control faults and how to handle each: `stall` → release the connection / 408, `backpressure-overflow` → fix the producer to honor pause or raise `maxBufferedBytes`, `row-too-large` → reject the client or raise `maxRowBytes`.
-- **[Scenario 3 — failures & retries](./scenario-3-error-retry.mjs)** — export side: the buffer is the safety net, so a failed export loses nothing and retry is idempotent via a `ReplacingMergeTree` key. Ingest side: errors are typed, a failed chunk lands zero rows, and streamed inserts are at-least-once → resend (dedup downstream).
+- **[Scenario 1 — the core pipeline](./scenario-1-ingest-join.mjs)** — end to end: per entity, one chDB statement globs the entity's `.pb` files, field-merges the create/update partials with `argMaxIf … GROUP BY id`, enriches via `dictGet` (prompt/price) + `match()` (model) + the token UDF, and exports. Verifies the merge kept the create event's `input` even when the latest event carried only `output` — engine-side, no read-modify-write in JS.
+- **[Scenario 2 — flow & resource control](./scenario-2-flow-control.mjs)** — there is no HTTP body to backpressure, so flow control is three things: **(A)** JS heap stays flat ingesting a 2 MB entity (data is off the V8 heap); **(B)** a single job's footprint is bounded by engine `SETTINGS` (`max_memory_usage`, `max_threads`), and a too-low cap fails with a typed `MEMORY_LIMIT_EXCEEDED` you handle; **(C)** one session serializes queries (per-process singleton, each internally multi-threaded) → you scale by adding Fargate tasks, not threads.
+- **[Scenario 3 — failures & retries](./scenario-3-error-retry.mjs)** — the unit of work is one per-entity statement: **(1)** a failed export → just re-run it; the destination `ReplacingMergeTree` dedups by `(id, event_ts)` and the merge is order-independent, so re-runs and concurrent writers converge with no lock; **(2)** a corrupt `.pb` → a typed parse error isolated to that entity, other jobs unaffected; **(3)** a late-arriving update → re-processing emits a higher-`event_ts` merged row and the destination keeps the latest.
+
+## What's real vs. pending
+
+Runs today on `chdb@3.1.0-rc.2`, with these substitutions for a self-contained demo (production form is in the comments at each call site in `_shared.mjs`):
+
+| Demo (runs now) | Production |
+| --- | --- |
+| `file('…/{eventBodyId}/*.pb','Protobuf')` over local files | `s3('s3://…/{eventBodyId}/*.pb','Protobuf')` — same glob, same format |
+| `bpe_count` SQL UDF (`length/4`) | `CREATE FUNCTION bpe_count LANGUAGE WASM …` (tiktoken-rs → wasm, vocab embedded). Needs chdb-core to enable the upstream WASM-UDF runtime (today: `SUPPORT_IS_DISABLED`). |
+| dictionaries `SOURCE(CLICKHOUSE(TABLE …))` | `SOURCE(POSTGRESQL(…))` — `complex_key_cache` (read-through) for prompts, `hashed`+`LIFETIME` for model/price |
+| `INSERT INTO events_priced` (local) | `INSERT INTO FUNCTION remoteSecure(…)` — native protocol |
 
 ## Production notes
 
-- Use a persistent session path (`new Session('./otel-buffer-data')`) so the buffer survives restarts. One chDB session per process; route all inserts through it.
-- The streaming lane only accepts line-delimited formats where a raw `\n` is guaranteed to be a row boundary — `JSONEachRow`, `JSONCompactEachRow`, `TabSeparated` (ClickHouse escapes newlines inside values). `CSV` and `*WithNames` are rejected for streams. Raw OTLP (protobuf, or the single-JSON-object OTLP/HTTP body) is **not** NDJSON: put a collector/shipper in front to emit one compact JSON object per line.
-- `input_format_skip_unknown_fields: 1` keeps wide OTEL payloads insertable while your schema models only what you query. Other `input_format_*` settings pass through the same `settings` option.
-- Nanosecond timestamps must travel as JSON **strings** (`"start_ns":"1780000000000000001"`) — the engine parses them into `UInt64` exactly, as scenario 1 verifies.
-- The `rowsSent` vs `rowsWritten` summary counts differ on purpose: `rowsSent` is the payload lines handed over; `rowsWritten` is the engine's write count, which includes rows a materialized view wrote (with one view attached, expect `rowsWritten ≈ 2 × rowsSent`) — the same semantics as ClickHouse's HTTP `X-ClickHouse-Summary`.
-- `JSON.stringify` throws on `BigInt` — when object-born rows carry 64-bit values, serialize with a replacer: `JSON.stringify(row, (k, v) => typeof v === 'bigint' ? String(v) : v)`. The object `insert()` path already handles `bigint` directly (scenario 1).
-- Prices are joined at export against the *current* `model_prices`. For point-in-time cost (the price as of the event), make `model_prices` a `dictionary` and call `dictGet(...)` inside the materialized view so the price is baked into each row at write time. (The JOIN, the dictionary, and `dictGet`-in-MV were all verified on embedded chDB v26.5.1.)
-- If your data is born as JS objects (per-row enrichment in JS), don't `stringify` the whole batch on the main thread in one go: serialize in a `worker_thread` and transfer the `ArrayBuffer` back for a raw insert, or yield NDJSON strings from an async generator into the streaming insert. Both keep stalls bounded; neither is free.
+- **Framing**: length-delimited protobuf — each message prefixed by a varint byte-length (`protobufjs` `encodeDelimited` = ClickHouse's `Protobuf` format). Pass the schema with `SETTINGS format_schema='observation.proto:Observation'` (the `.proto` can also be an inline string via `format_schema_source='string'`).
+- **The glob reads everything**: `s3('…/*.pb')` follows the S3 `ListObjectsV2` continuation token across all pages; `s3_list_object_keys_size` is only the per-page size, not a cap. `*` matches within one path segment, so `{eventBodyId}/*.pb` is exactly that entity's files. (Completeness is bounded only by S3 LIST consistency — strongly consistent on AWS since 2020-12; verify for MinIO/compatible stores.)
+- **Dictionaries replace Redis on this path**: a chDB dictionary *is* an in-engine cache over Postgres (the source of truth), so source the dicts straight from PG. model/price = `hashed`+`LIFETIME`; prompt = `complex_key_cache` (read-through, so a brand-new prompt version resolves on a miss). The dictionary lives at the worker **process** scope and stays warm across jobs (the worker is a long-running consumer; jobs are short, the process is not).
+- **Cross-chunk / cross-time merge is the destination's job**: if the producer writes full rows, use `ReplacingMergeTree(event_ts)`; if it writes partial deltas, use `AggregatingMergeTree` + per-column `argMaxIf(col, event_ts, col<>'')`. Both are order-independent, so multiple Fargate writers need no lock — confirm with your producer which one applies.
+- **Scale-out is process-level**: one chDB session per process (a hard singleton — different data path → `Code:36`), each saturating its task's vCPUs on a single statement. Add Fargate tasks to scale throughput; don't open worker_threads for parallelism.
+- **Big chunks are orthogonal**: writing fewer, larger `.pb` files (MB–100MB) kills the S3 small-file request volume, but the design works unchanged on per-entity files (this demo).
 
-## Interface — streaming `insert()`
+## Interface — the per-entity statement
 
-Use this path when your high-traffic payload is already serialized as NDJSON, for example OTEL traces delivered through an HTTP request body.
+The whole pipeline is one statement, built by `entityInsertSQL(glob)` in `_shared.mjs`. Production swaps `file()`→`s3()` and the target table → `INSERT INTO FUNCTION remoteSecure(...)`; nothing else changes.
 
-The important part is: do not `JSON.parse()` or `JSON.stringify()` the whole payload on the main thread. Pass the byte stream directly to `insert()` with `format: 'JSONEachRow'`. chdb-node will consume the stream with backpressure, cut chunks only at row boundaries, and write each chunk through the native raw insert path.
+```sql
+INSERT INTO <target>
+WITH merged AS (
+  SELECT
+    id,
+    argMaxIf(input,          ts, input          != '') AS input,    -- field-level merge:
+    argMaxIf(output,         ts, output         != '') AS output,   --  create + update partials
+    argMaxIf(model,          ts, model          != '') AS model,    --  collapse to one full row
+    argMaxIf(prompt_name,    ts, prompt_name    != '') AS prompt_name,
+    argMaxIf(prompt_version, ts, prompt_version != 0)  AS prompt_version,
+    max(ts) AS event_ts
+  FROM s3('s3://…/{eventBodyId}/*.pb','Protobuf')                   -- read + parse protobuf
+  GROUP BY id
+)
+SELECT
+  m.id, m.model, m.event_ts,
+  dictGet('prompt_dict','id',(m.project_id, m.prompt_name, m.prompt_version)) AS prompt_id,
+  md.model_id,
+  bpe_count(m.input,  md.tokenizer)  AS input_tokens,              -- WASM UDF in production
+  bpe_count(m.output, md.tokenizer)  AS output_tokens,
+  input_tokens * dictGet('price_dict','in_micro', tuple(md.model_id)) / 1e6 AS total_cost
+FROM merged AS m, models AS md
+WHERE match(m.model, md.pattern)                                   -- model regex match
+SETTINGS format_schema = 'observation.proto:Observation'
+```
+
+From Node, this is just:
 
 ```js
-import http from 'node:http'
 import chdb from 'chdb'
+import { entityGlob, entityInsertSQL, setupEngine } from './_shared.mjs'
 
-const { Session } = chdb
-const session = new Session()
-
-session.query(`
-  CREATE TABLE IF NOT EXISTS otel_traces
-  (
-    trace_id String,
-    span_id String,
-    parent_span_id String,
-    name String,
-    start_ns UInt64,
-    end_ns UInt64,
-    attributes_json String
-  )
-  ENGINE = MergeTree
-  ORDER BY (trace_id, span_id)
-`)
-
-const server = http.createServer(async (req, res) => {
-  if (req.method !== 'POST' || req.url !== '/ingest/traces') {
-    res.writeHead(404).end()
-    return
-  }
-
-  try {
-    const summary = await session.insert({
-      table: 'otel_traces',
-      values: req,
-      format: 'JSONEachRow',
-
-      // Optional: only insert the columns modeled in the table.
-      // Unknown fields in a wider OTEL payload are skipped by the engine.
-      settings: {
-        input_format_skip_unknown_fields: 1,
-      },
-
-      // Optional streaming controls.
-      maxChunkBytes: 8 * 1024 * 1024,
-      maxRowBytes: 64 * 1024 * 1024,
-      maxBufferedBytes: 64 * 1024 * 1024,
-      stallTimeout: 30_000,
-
-      onProgress: (p) => {
-        console.log('insert progress', p)
-      },
-    })
-
-    res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({
-      ok: true,
-      rowsSent: summary.rowsSent,
-      rowsWritten: summary.rowsWritten,
-      bytesSent: summary.bytesSent,
-      bytesWritten: summary.bytesWritten,
-      chunks: summary.chunks,
-      elapsed: summary.elapsed,
-    }))
-  } catch (e) {
-    res.writeHead(500, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({
-      ok: false,
-      code: e.code,
-      reason: e.reason,
-      failedAtRow: e.failedAtRow,
-      progress: e.progress,
-      message: e.message,
-    }))
-  }
-})
-
-server.listen(3000)
+const session = new chdb.Session()
+setupEngine(session)                                   // dicts + token UDF + destination (once)
+session.query(entityInsertSQL(entityGlob(DATA, eventBodyId)))   // per job: pass a path, await
 ```
-
-### Input
-
-`values: req` passes the HTTP request body directly as the streaming payload. The stream must yield bytes: `Buffer`, `Uint8Array`, or `string`.
-
-`format: 'JSONEachRow'` tells chDB to parse the payload as NDJSON: one JSON object per line. Only line-delimited formats are accepted for streams (`JSONEachRow`, `JSONCompactEachRow`, `TabSeparated`); `CSV` and `*WithNames` are rejected.
-
-`settings.input_format_skip_unknown_fields: 1` is useful for wide OTEL payloads. Your table can model only the fields you query, while chDB skips extra JSON fields during insert.
-
-### Streaming controls
-
-`maxChunkBytes` is the target chunk size. Default: `8 MiB`.
-
-chdb-node accumulates incoming bytes until it reaches roughly this size, then cuts only at the latest `\n` row boundary and inserts that chunk.
-
-`maxRowBytes` is the largest allowed single row. Default: `64 MiB`.
-
-If no newline is seen and the buffered row grows past this limit, insert fails with `reason: 'row-too-large'`.
-
-`maxBufferedBytes` protects against sources that ignore backpressure. Default: `64 MiB`.
-
-If a push-style `Readable` has already buffered more than this, insert fails with `reason: 'backpressure-overflow'` instead of buffering unboundedly.
-
-`stallTimeout` is an optional producer idle timeout.
-
-If the source neither yields data nor ends within this time, insert fails with `ChdbTimeoutError` and `reason: 'stall'`.
-
-`onProgress` is called after each chunk is successfully written.
-
-```js
-onProgress: (p) => {
-  // p = { rowsSent, bytesSent, chunks }
-}
-```
-
-### Output
-
-A successful streaming insert returns:
-
-```js
-{
-  rowsWritten: 100000,
-  bytesWritten: 12345678,
-  rowsSent: 100000,
-  bytesSent: 12345678,
-  chunks: 12,
-  elapsed: 1.23
-}
-```
-
-`rowsSent` is the payload-side count: non-empty NDJSON lines successfully flushed.
-
-`rowsWritten` is the engine-side count returned by chDB / ClickHouse. It may include materialized-view cascade writes, so it can be larger than `rowsSent`.
-
-`bytesSent` is the number of payload bytes flushed from the stream.
-
-`bytesWritten` is the engine-side written-byte counter.
-
-`chunks` is how many bounded chunks were inserted.
-
-`elapsed` is the accumulated engine execution time across chunks.
-
-### Error handling
-
-Streaming insert is at-least-once. Chunks already written before an error are not rolled back.
-
-For retry, resend from your source and deduplicate downstream if needed. Treat `failedAtRow` and `progress` as observability fields, not as a resume cursor.
-
-Common errors:
-
-`reason: 'source-error'`
-
-The producer stream failed or closed unexpectedly.
-
-`reason: 'write-failure'`
-
-chDB rejected one chunk, for example because of malformed JSON or a type mismatch. The error may include `failedAtRow`.
-
-`reason: 'row-too-large'`
-
-A single NDJSON row exceeded `maxRowBytes`.
-
-`reason: 'backpressure-overflow'`
-
-The source ignored backpressure and buffered beyond `maxBufferedBytes`.
-
-`reason: 'stall'`
-
-The producer stopped yielding data and did not end before `stallTimeout`.
-
-`code: 'CHDB_ABORT'`
-
-The insert was aborted through `AbortSignal`.
 
 ## Try next
 
-- **Worker-thread serialization bridge** — for object-born rows: stringify off the main thread, transfer the bytes, insert raw.
-- **Checkpointed export** — resumable, part-based export with O(1) buffer cleanup (recipe in progress).
+- **Enable the WASM UDF** in chdb-core (the upstream runtime is merged but `SUPPORT_IS_DISABLED`), then swap the `bpe_count` placeholder for a tiktoken-rs WASM module.
+- **Point the dictionaries at Postgres** (`SOURCE(POSTGRESQL(…))`) and the export at `remoteSecure(...)` to run against a real Langfuse stack.
+- **Switch the destination to `AggregatingMergeTree` + argMaxIf** if your S3 events are partial deltas rather than coalesced full rows.

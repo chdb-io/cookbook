@@ -1,98 +1,73 @@
-// Scenario 3 — failures and retries. Two surfaces fail, and they retry
-// differently; the buffer is what makes both safe.
+// Scenario 3 — failures & retries in the pull model.
 //
-//   A. Export side (ClickHouse unreachable): rows stay in the local buffer, so
-//      retry = run the export again. A ReplacingMergeTree keyed on
-//      (trace_id, span_id) makes a re-run idempotent.
-//   B. Ingest side (bad payload / producer dies): errors are typed and a failed
-//      chunk lands zero rows, so retry = resend. Streaming inserts are
-//      at-least-once — failedAtRow/progress are observability, not a cursor.
+// The unit of work is one per-entity SQL statement (glob → merge → enrich →
+// export). Three failure modes, and why each is safe:
+//
+//   1. Export fails (remoteSecure down)  → just re-run the same statement.
+//      Idempotent: the destination ReplacingMergeTree dedups by (id, event_ts),
+//      and the merge is order-independent — re-runs and concurrent writers from
+//      multiple Fargate tasks converge to one row. No app-side lock.
+//   2. Corrupt chunk (bad .pb)           → that entity's job throws a typed parse
+//      error and is isolated; other entities' jobs are unaffected. Quarantine /
+//      retry just that one.
+//   3. Late-arriving update              → an update file shows up after the row
+//      was already exported. Re-processing the entity emits a higher-event_ts
+//      merged row; the destination engine keeps the latest. No read-back.
 //
 // Run:  node scenario-3-error-retry.mjs
 
-import { Readable } from 'node:stream'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import chdb from 'chdb'
-import { createSchema, span, spanLines } from './_shared.mjs'
+import { PROJECT, entityGlob, entityInsertSQL, seedEntity, setupEngine, writeEvent } from './_shared.mjs'
 
-const { Session } = chdb
-const session = new Session()
-createSchema(session)
+const DATA = join(dirname(fileURLToPath(import.meta.url)), 'pb-data')
+rmSync(DATA, { recursive: true, force: true })
 
-const count = () => Number(session.query('SELECT count() FROM events', 'CSV').trim())
+const session = new chdb.Session()
+setupEngine(session) // destination = ReplacingMergeTree(event_ts)
 
-// Seed the buffer with good data, streamed in.
-await session.insert({ table: 'otel_raw', values: Readable.from(spanLines(0, 1000, 'acme')),
-  format: 'JSONEachRow', settings: { input_format_skip_unknown_fields: 1 } })
-console.log('buffered           :', count(), 'rows ready to export\n')
+// ---------------------------------------------------------------------------
+// 1. Export failure → idempotent re-run. Process the same entity twice (a retry
+//    after a failed export). The destination collapses the duplicate by event_ts.
+// ---------------------------------------------------------------------------
+seedEntity(DATA, { id: 'retry_me', model: 'gpt-4o-2024-08-06', prompt: ['summarize', 3], input: 'hello', output: 'world' })
+session.query(entityInsertSQL(entityGlob(DATA, 'retry_me')))
+session.query(entityInsertSQL(entityGlob(DATA, 'retry_me'))) // the retry
+const raw = session.query("SELECT count() FROM events_priced WHERE id='retry_me'", 'CSV').trim()
+const final = session.query("SELECT count() FROM events_priced FINAL WHERE id='retry_me'", 'CSV').trim()
+console.log('1. retry safe     :', `${raw} raw rows → ${final} after FINAL (ReplacingMergeTree dedup by id+event_ts; re-run is a no-op)`)
 
-// ===========================================================================
-// A. Export when ClickHouse is down → data stays in the buffer → retry.
-// ===========================================================================
-const exportTo = (target) => session.queryAsync(`
-  INSERT INTO ${target}
-  SELECT trace_id, span_id, start_ns, duration_ms, name, model,
-         input_tokens, output_tokens, prompt_preview, tenant, received_at
-  FROM events`, { timeout: 4000 })
-
-// First attempt: server unreachable (a closed port stands in for "CH is down").
-let exported = false
+// ---------------------------------------------------------------------------
+// 2. Corrupt chunk → typed error, isolated to that entity. A bad .pb file under
+//    one entity fails only that job; a healthy entity processes fine.
+// ---------------------------------------------------------------------------
+const badDir = join(DATA, 'events', PROJECT, 'observation', 'corrupt')
+mkdirSync(badDir, { recursive: true })
+writeFileSync(join(badDir, 'evt.pb'), Buffer.from('this is not a valid protobuf message at all'))
 try {
-  await exportTo(`FUNCTION remoteSecure('127.0.0.1:1', 'otel.events', 'default', 'x')`)
-  exported = true
+  session.query(entityInsertSQL(entityGlob(DATA, 'corrupt')))
+  console.log('2. corrupt chunk  : (unexpected) corrupt .pb did not error')
 } catch (e) {
-  console.log('A. export attempt  : FAILED —', e.code, '(ClickHouse unreachable)')
-  console.log('   buffer intact   :', count(), 'rows still in the buffer — nothing lost')
+  console.log('2. corrupt chunk  :', `typed parse error → quarantine/retry just this entity (${e.message.split('\n')[0].slice(0, 70)}…)`)
 }
+seedEntity(DATA, { id: 'healthy', model: 'claude-fable-5', prompt: ['classify', 1], input: 'fine', output: 'ok' })
+session.query(entityInsertSQL(entityGlob(DATA, 'healthy')))
+console.log('                    healthy entity exported fine — the bad chunk did not affect other jobs')
 
-// Retry: ClickHouse is back. Here a local ReplacingMergeTree stands in for the
-// server table; the dedup key makes a re-run safe even if a prior export had
-// half-succeeded.
-session.query(`
-  CREATE TABLE warehouse (
-    trace_id String, span_id String, start_ns UInt64, duration_ms Float64,
-    name String, model String, input_tokens UInt64, output_tokens UInt64,
-    prompt_preview String, tenant String, received_at DateTime64(9)
-  ) ENGINE = ReplacingMergeTree ORDER BY (trace_id, span_id)`)
-if (!exported) {
-  await exportTo('warehouse')
-  await exportTo('warehouse')                       // retry again — idempotent by construction
-  session.query('OPTIMIZE TABLE warehouse FINAL')   // force the dedup merge for the demo
-  const dst = Number(session.query('SELECT count() FROM warehouse', 'CSV').trim())
-  console.log('   retry succeeded :', dst, 'rows exported (two runs collapsed to one by ReplacingMergeTree)\n')
-}
-
-// ===========================================================================
-// B1. A corrupt line: the chunk is rejected, zero rows land.
-// ===========================================================================
-const before = count()
-const corruptLines = [span(9001, 'acme') + '\n', '{this is not json\n', span(9002, 'acme') + '\n']
-try {
-  await session.insert({ table: 'otel_raw', values: Readable.from(corruptLines),
-    format: 'JSONEachRow', settings: { input_format_skip_unknown_fields: 1 } })
-} catch (e) {
-  console.log('B1. corrupt batch  : rejected —', e.code, 'reason=' + e.reason, 'failedAtRow=' + e.failedAtRow,
-    '| rows landed:', count() - before, '(failed chunk lands zero rows)')
-}
-// Fix the offending line and resend: it succeeds.
-await session.insert({ table: 'otel_raw',
-  values: Readable.from([span(9001, 'acme') + '\n', span(9003, 'acme') + '\n', span(9002, 'acme') + '\n']),
-  format: 'JSONEachRow', settings: { input_format_skip_unknown_fields: 1 } })
-console.log('    resend fixed   : +' + (count() - before), 'rows landed after fixing the line\n')
-
-// ===========================================================================
-// B2. The producer dies mid-stream → the insert settles with reason
-//     'source-error' — no hang, no unhandledRejection.
-// ===========================================================================
-const broken = new Readable({ read() {} })
-broken.push(span(0, 'acme') + '\n')
-broken.push(span(1, 'acme') + '\n')
-queueMicrotask(() => broken.destroy(new Error('client connection reset')))
-try {
-  await session.insert({ table: 'otel_raw', values: broken, format: 'JSONEachRow',
-    settings: { input_format_skip_unknown_fields: 1 }, maxChunkBytes: 1 * 1024 * 1024 })
-} catch (e) {
-  console.log('B2. producer died  : settled —', JSON.stringify({ code: e.code, reason: e.reason }),
-    '(at-least-once: flushed chunks stay, retry = resend from your source)')
-}
+// ---------------------------------------------------------------------------
+// 3. Late-arriving update → re-process; the destination keeps the latest version.
+// ---------------------------------------------------------------------------
+writeEvent(DATA, 'late', 'evt-create', { id: 'late', ts: 2000, project_id: PROJECT, trace_id: 'trace_late', input: 'q', model: 'gpt-4o-2024-08-06', prompt_name: 'extract', prompt_version: 2 })
+session.query(entityInsertSQL(entityGlob(DATA, 'late')))
+const beforeOut = session.query("SELECT output_tokens FROM events_priced FINAL WHERE id='late'", 'CSV').trim()
+// ...the update event lands later, in a new file...
+writeEvent(DATA, 'late', 'evt-update', { id: 'late', ts: 2005, output: 'an answer' })
+session.query(entityInsertSQL(entityGlob(DATA, 'late'))) // re-process; merged row has higher event_ts
+const afterOut = session.query("SELECT output_tokens FROM events_priced FINAL WHERE id='late'", 'CSV').trim()
+console.log('3. late update    :', `output_tokens ${beforeOut} → ${afterOut} after the update arrived`,
+  '(higher event_ts wins; order-independent, so concurrent task re-runs are safe)')
 
 session.close()
+rmSync(DATA, { recursive: true, force: true })

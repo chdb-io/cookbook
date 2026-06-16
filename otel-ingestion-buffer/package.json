@@ -9,6 +9,7 @@
     "scenario:3": "node scenario-3-error-retry.mjs"
   },
   "dependencies": {
-    "chdb": "3.1.0-rc.2"
+    "chdb": "3.1.0-rc.2",
+    "protobufjs": "^8.6.3"
   }
 }

@@ -1,0 +1,20 @@
+// Schema for the OTEL observation events that land on S3 as length-delimited
+// protobuf (each message framed by a varint byte-length prefix — exactly what
+// ClickHouse's `Protobuf` format reads, and what protobufjs `encodeDelimited`
+// writes). One observation (an LLM generation/span) arrives over time as a
+// `generation-create` then one or more `generation-update` messages, each
+// carrying only the fields it knows — so most fields are empty on any single
+// message and get merged engine-side (see scenario-4).
+syntax = "proto3";
+
+message Observation {
+  string id             = 1;  // eventBodyId — the entity key (dedup/merge key)
+  uint64 ts             = 2;  // event time (ns or ms) — the merge version
+  string project_id     = 3;
+  string trace_id       = 4;
+  string input          = 5;  // prompt text (born on create)
+  string output         = 6;  // completion text (born on update)
+  string model          = 7;  // provided model name, e.g. "gpt-4o-2024-08-06"
+  string prompt_name    = 8;
+  uint32 prompt_version = 9;
+}
