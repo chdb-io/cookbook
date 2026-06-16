@@ -39,7 +39,7 @@ for (let i = 0; i < 8; i++) {
 // ---------------------------------------------------------------------------
 global.gc?.()
 const before = process.memoryUsage().heapUsed
-session.query(entityInsertSQL(entityGlob(DATA, 'big')))
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'big')))
 global.gc?.()
 const after = process.memoryUsage().heapUsed
 console.log('A. bounded memory :', `JS heap Δ ${((after - before) / 1024).toFixed(1)} KiB while ingesting a 2 MB entity`,
@@ -50,13 +50,13 @@ console.log('A. bounded memory :', `JS heap Δ ${((after - before) / 1024).toFix
 //    error (handle it: raise the cap / shrink the chunk); a sane cap succeeds.
 // ---------------------------------------------------------------------------
 try {
-  session.query(entityInsertSQL(entityGlob(DATA, 'big'), { extraSettings: 'max_memory_usage = 1' }))
+  await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'big'), { extraSettings: 'max_memory_usage = 1' }))
   console.log('B. resource cap   : (unexpected) tiny cap did not trip')
 } catch (e) {
   const limited = /MEMORY_LIMIT_EXCEEDED|Memory limit/i.test(e.message)
   console.log('B. resource cap   :', limited ? 'typed MEMORY_LIMIT_EXCEEDED at max_memory_usage=1 → raise the cap or split the chunk' : `error: ${e.message.slice(0, 80)}`)
 }
-session.query(entityInsertSQL(entityGlob(DATA, 'big'), { extraSettings: 'max_memory_usage = 2000000000, max_threads = 4' }))
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'big'), { extraSettings: 'max_memory_usage = 2000000000, max_threads = 4' }))
 console.log('                    sane cap (2 GB, 4 threads) → ok; one job\'s footprint is bounded by SETTINGS')
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ console.log('                    sane cap (2 GB, 4 threads) → ok; one job\'s f
 //    more processes (Fargate tasks), each its own session, all writing the same CH.
 // ---------------------------------------------------------------------------
 const t0 = Date.now()
-for (let i = 0; i < 8; i++) session.query(entityInsertSQL(entityGlob(DATA, `obs_${i}`)))
+for (let i = 0; i < 8; i++) await session.queryAsync(entityInsertSQL(entityGlob(DATA, `obs_${i}`)))
 console.log('C. throughput     :', `8 entity jobs serialized through one session in ${Date.now() - t0} ms`,
   '(one chDB per process; scale by adding Fargate tasks, not worker threads)')
 

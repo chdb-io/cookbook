@@ -19,7 +19,10 @@
 // Real here (runs today on chdb-node 3.1.0-rc.2): protobuf read, the per-entity
 // glob, the SQL field-merge, dictGet/match enrichment. Stubbed for the PoC: the
 // token UDF (SQL placeholder → WASM), the dict source (local table → Postgres),
-// and the export target (local table → remoteSecure). See ../langfuse_chdb_final_design_en.md.
+// and the export target (local table → remoteSecure).
+//
+// The per-entity job runs as `await session.queryAsync(...)`: the engine executes
+// off a worker thread, so the Node event loop stays free while the job runs.
 //
 // Run:  node scenario-1-ingest-join.mjs
 
@@ -50,9 +53,9 @@ console.log(`generated protobuf for ${entities.length} entities under ${PREFIX}/
 //    target → INSERT INTO FUNCTION remoteSecure(...). Nothing else changes.
 // ---------------------------------------------------------------------------
 const session = new chdb.Session()
-setupEngine(session)
-for (const e of entities) session.query(entityInsertSQL(entityGlob(DATA, e.id)))
-console.log(`processed ${entities.length} entity jobs (each = one chDB glob → merge → enrich → export pass)\n`)
+setupEngine(session) // one-time startup DDL (sync is fine at boot)
+for (const e of entities) await session.queryAsync(entityInsertSQL(entityGlob(DATA, e.id)))
+console.log(`processed ${entities.length} entity jobs (each = one async chDB glob → merge → enrich → export pass)\n`)
 
 // ---------------------------------------------------------------------------
 // 3. Verify: rows are merged + enriched, with ZERO JSON.parse / field-merge in JS.

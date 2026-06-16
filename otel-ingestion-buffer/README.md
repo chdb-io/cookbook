@@ -10,8 +10,6 @@ price lookups + token counting), and exports to a ClickHouse server over the
 native protocol. JavaScript never calls `JSON.parse`, never merges rows, never
 touches a socket.
 
-> Design of record: [`../langfuse_chdb_final_design_en.md`](../langfuse_chdb_final_design_en.md). Everything here follows it.
-
 > **Requires** `chdb@3.1.0-rc.2` (chdb-node on the chdb-core v26.5.1-rc.1 engine), Node 20+, and `protobufjs` (to generate the sample `.pb`). The scenarios run end to end against embedded chDB.
 >
 > ```bash
@@ -121,9 +119,13 @@ import chdb from 'chdb'
 import { entityGlob, entityInsertSQL, setupEngine } from './_shared.mjs'
 
 const session = new chdb.Session()
-setupEngine(session)                                   // dicts + token UDF + destination (once)
-session.query(entityInsertSQL(entityGlob(DATA, eventBodyId)))   // per job: pass a path, await
+setupEngine(session)                                           // one-time startup DDL (sync at boot)
+// per job: pass a path and await — queryAsync runs the engine off a worker
+// thread, so the Node event loop is never frozen while a job runs.
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, eventBodyId)))
 ```
+
+Use the synchronous `session.query` for one-time startup DDL; use `await session.queryAsync(...)` on the per-entity hot path so a running job never blocks the event loop (chdb-node 3 executes async queries on a libuv worker thread).
 
 ## Try next
 

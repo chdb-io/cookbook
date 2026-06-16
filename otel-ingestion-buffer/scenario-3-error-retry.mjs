@@ -33,8 +33,8 @@ setupEngine(session) // destination = ReplacingMergeTree(event_ts)
 //    after a failed export). The destination collapses the duplicate by event_ts.
 // ---------------------------------------------------------------------------
 seedEntity(DATA, { id: 'retry_me', model: 'gpt-4o-2024-08-06', prompt: ['summarize', 3], input: 'hello', output: 'world' })
-session.query(entityInsertSQL(entityGlob(DATA, 'retry_me')))
-session.query(entityInsertSQL(entityGlob(DATA, 'retry_me'))) // the retry
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'retry_me')))
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'retry_me'))) // the retry
 const raw = session.query("SELECT count() FROM events_priced WHERE id='retry_me'", 'CSV').trim()
 const final = session.query("SELECT count() FROM events_priced FINAL WHERE id='retry_me'", 'CSV').trim()
 console.log('1. retry safe     :', `${raw} raw rows → ${final} after FINAL (ReplacingMergeTree dedup by id+event_ts; re-run is a no-op)`)
@@ -47,24 +47,24 @@ const badDir = join(DATA, 'events', PROJECT, 'observation', 'corrupt')
 mkdirSync(badDir, { recursive: true })
 writeFileSync(join(badDir, 'evt.pb'), Buffer.from('this is not a valid protobuf message at all'))
 try {
-  session.query(entityInsertSQL(entityGlob(DATA, 'corrupt')))
+  await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'corrupt')))
   console.log('2. corrupt chunk  : (unexpected) corrupt .pb did not error')
 } catch (e) {
   console.log('2. corrupt chunk  :', `typed parse error → quarantine/retry just this entity (${e.message.split('\n')[0].slice(0, 70)}…)`)
 }
 seedEntity(DATA, { id: 'healthy', model: 'claude-fable-5', prompt: ['classify', 1], input: 'fine', output: 'ok' })
-session.query(entityInsertSQL(entityGlob(DATA, 'healthy')))
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'healthy')))
 console.log('                    healthy entity exported fine — the bad chunk did not affect other jobs')
 
 // ---------------------------------------------------------------------------
 // 3. Late-arriving update → re-process; the destination keeps the latest version.
 // ---------------------------------------------------------------------------
 writeEvent(DATA, 'late', 'evt-create', { id: 'late', ts: 2000, project_id: PROJECT, trace_id: 'trace_late', input: 'q', model: 'gpt-4o-2024-08-06', prompt_name: 'extract', prompt_version: 2 })
-session.query(entityInsertSQL(entityGlob(DATA, 'late')))
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'late')))
 const beforeOut = session.query("SELECT output_tokens FROM events_priced FINAL WHERE id='late'", 'CSV').trim()
 // ...the update event lands later, in a new file...
 writeEvent(DATA, 'late', 'evt-update', { id: 'late', ts: 2005, output: 'an answer' })
-session.query(entityInsertSQL(entityGlob(DATA, 'late'))) // re-process; merged row has higher event_ts
+await session.queryAsync(entityInsertSQL(entityGlob(DATA, 'late'))) // re-process; merged row has higher event_ts
 const afterOut = session.query("SELECT output_tokens FROM events_priced FINAL WHERE id='late'", 'CSV').trim()
 console.log('3. late update    :', `output_tokens ${beforeOut} → ${afterOut} after the update arrived`,
   '(higher event_ts wins; order-independent, so concurrent task re-runs are safe)')

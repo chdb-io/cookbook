@@ -1,12 +1,16 @@
 // Shared scaffolding for the OTEL ingestion cookbook.
 //
-// The design (see ../langfuse_chdb_final_design_en.md): the payload already sits
-// on S3 as length-delimited protobuf, keyed by entity
+// The payload already sits on S3 as length-delimited protobuf, keyed by entity
 // (s3://…/{projectId}/observation/{eventBodyId}/*.pb). Per entity, JavaScript
 // only hands chDB a glob path; ONE SQL statement reads + parses the protobuf,
 // field-merges the create/update partial events (argMaxIf … GROUP BY id),
 // enriches via dictGet (prompt/price) + match() (model) + a token UDF, and
 // exports — no row data, no JSON.parse, no field-merge in JavaScript.
+//
+// Sync vs async: one-time startup DDL uses the synchronous `session.query` (it
+// runs once at boot, blocking there is fine). The per-entity hot path runs as
+// `await session.queryAsync(...)` so the engine executes off a worker thread and
+// the Node event loop is never frozen while a job runs.
 //
 // Demo substitutions (production form in comments at each call site):
 //   • file('…/*.pb','Protobuf')        → s3('s3://…/*.pb','Protobuf')
