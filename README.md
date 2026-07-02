@@ -28,6 +28,7 @@ Every notebook runs end-to-end with `pip install chdb` and the dependencies list
 
 ### agents
 - [Federated SQL for Claude Dynamic Workflows](dynamic-workflows/README.md) — give every subagent an in-process engine that joins S3, Postgres, ClickHouse, an HTTP API, and a DataFrame in one query.
+- [A data analyst agent with chDB in 50 lines — on AWS Lambda MicroVMs](lambda-microvms/README.md) — build a complete analyst agent (Claude + one `execute_sql` tool + chDB), then give every user their own Firecracker-isolated copy: snapshot-hot starts, suspend/resume with memory intact, one MicroVM per session. *(Deployment recipe; the agent also runs standalone on a laptop.)*
 
 ### ingestion
 - [OTEL ingestion buffer in Node.js](otel-ingestion-buffer/README.md) — use chDB as an off-heap ingestion buffer in a Node.js service: zero-copy span ingestion (no `JSON.parse` on the main thread), engine-side enrichment, and native-protocol export — with flow control and failure/retry recipes. *(Node.js, not a Python notebook.)*
