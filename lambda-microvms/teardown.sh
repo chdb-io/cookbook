@@ -19,8 +19,13 @@ for id in $(aws lambda-microvms list-microvms --region "${REGION}" \
 done
 
 echo "==> deleting image ${IMAGE_ARN}"
-aws lambda-microvms delete-microvm-image --image-identifier "${IMAGE_ARN}" \
-  --region "${REGION}" >/dev/null 2>&1 || echo "    (no image to delete)"
+if aws lambda-microvms get-microvm-image --image-identifier "${IMAGE_ARN}" \
+     --region "${REGION}" >/dev/null 2>&1; then
+  aws lambda-microvms delete-microvm-image --image-identifier "${IMAGE_ARN}" \
+    --region "${REGION}" >/dev/null   # a real deletion error aborts loudly here
+else
+  echo "    (no image to delete)"
+fi
 
 echo "==> deleting bucket s3://${BUCKET}"
 aws s3 rb "s3://${BUCKET}" --force >/dev/null 2>&1 || echo "    (no bucket to delete)"

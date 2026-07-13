@@ -15,6 +15,7 @@
 #   ./deploy.sh                  # us-west-2, image + one MicroVM
 #   REGION=us-east-1 ./deploy.sh
 set -euo pipefail
+cd "$(dirname "$0")"   # the zip step below packages files by bare name
 
 REGION="${REGION:-us-west-2}"
 NAME="${NAME:-chdb-sql-sandbox}"
@@ -188,7 +189,7 @@ RUN_OUT=$(aws lambda-microvms run-microvm \
   --execution-role-arn "${EXEC_ROLE_ARN}" \
   --ingress-network-connectors "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:ALL_INGRESS" \
   --egress-network-connectors "arn:aws:lambda:${REGION}:aws:network-connector:aws-network-connector:INTERNET_EGRESS" \
-  --idle-policy '{"autoResumeEnabled":true,"maxIdleDurationSeconds":900,"suspendedDurationSeconds":3600}' \
+  --idle-policy '{"autoResumeEnabled":true,"maxIdleDurationSeconds":900,"suspendedDurationSeconds":28800}' \
   --maximum-duration-in-seconds 28800 \
   --logging "{\"cloudWatch\":{\"logGroup\":\"/aws/lambda-microvms/${NAME}\"}}" \
   --region "${REGION}")
@@ -202,6 +203,7 @@ for _ in $(seq 1 60); do
   [ "${STATE}" = "RUNNING" ] && { echo " RUNNING"; break; }
   echo -n "."; sleep 5
 done
+[ "${STATE}" = "RUNNING" ] || { echo " MicroVM did not reach RUNNING (state: ${STATE})"; exit 1; }
 
 # --- 6. smoke test -----------------------------------------------------------
 TOKEN=$(aws lambda-microvms create-microvm-auth-token \

@@ -24,8 +24,8 @@ TOOLS = [{
 
 ```bash
 pip install chdb anthropic
-python init_db.py                       # bakes 1M rows of ClickBench web analytics (~18s, 122 MiB)
-CHDB_DATA_PATH=/app/chdb-data ANTHROPIC_API_KEY=sk-... python agent.py
+CHDB_DATA_PATH=./chdb-data python init_db.py       # bakes 1M rows of ClickBench web analytics (~18s, 122 MiB)
+CHDB_DATA_PATH=./chdb-data ANTHROPIC_API_KEY=sk-... python agent.py
 ```
 
 ```
