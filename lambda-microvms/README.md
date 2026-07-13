@@ -233,3 +233,4 @@ You pay for MicroVM runtime (suspended = free), image-version storage, the S3 ar
 - Bake more partitions: `BAKE_PARTITIONS=10` as a Docker build arg → 10M rows in the snapshot.
 - Point the federation demo at your own bucket, or join `postgresql()` dimension tables in the same statement.
 - Wire `/ask` into a real UI and one MicroVM per signed-in user — the [launch-partner demo](https://github.com/nklmish/chdb-lambda-microvm-demo) shows the full production shape.
+- Same analyst, other clouds: ports of this recipe to Azure Container Apps Sandboxes and GKE Agent Sandbox (the other two snapshot-based agent sandboxes) are coming next in this cookbook — `agent.py` runs unchanged on all three.
