@@ -54,6 +54,7 @@ curl -s $URL/ask -H 'Content-Type: application/json' \
 
 ## Container Apps specifics
 
+- **Ingress (important):** `/query` runs caller-supplied SQL, so `deploy.sh` uses **internal ingress by default** (reachable only inside the Container Apps environment); `PUBLIC=1 ./deploy.sh` switches to external for a throwaway public demo. No managed identity is attached, so there is no cloud credential to reach via SSRF — but front it with Container Apps authentication before exposing anything real.
 - **Concurrency:** per-replica concurrency plus `--max-replicas` controls fan-out over the engine lock. For read-heavy traffic, more replicas beat more threads.
 - **Secrets:** use `--secrets` + `secretref:` instead of the demo's plain env var.
 - **Rebake:** re-run `deploy.sh` after editing `init_db.py` — ACR Tasks produces a fresh image, still with no local Docker.

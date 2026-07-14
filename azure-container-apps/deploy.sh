@@ -33,7 +33,13 @@ echo "==> region ${REGION}, resource group ${RG}"
 for ns in Microsoft.App Microsoft.ContainerRegistry Microsoft.OperationalInsights; do
   az provider register -n "$ns" --wait -o none
 done
-az group create -n "${RG}" -l "${REGION}" -o none
+# create the group only if it doesn't already exist, and tag the one we create
+# so teardown can tell ours apart from a pre-existing (possibly empty) group
+if az group show -n "${RG}" >/dev/null 2>&1; then
+  echo "    (resource group ${RG} already exists — leaving its ownership alone)"
+else
+  az group create -n "${RG}" -l "${REGION}" --tags chdb-cookbook=true -o none
+fi
 
 echo "==> registry ${ACR} + server-side image build (bakes the 1M-row store)"
 az acr create -g "${RG}" -n "${ACR}" --sku Basic --admin-enabled true -o none
@@ -49,18 +55,29 @@ if [ -n "${ANTHROPIC_API_KEY}" ]; then
   # env var for a demo; use --secrets + secretref for production
   ENV_FLAG=(--env-vars "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
 fi
+# /query runs caller-supplied ClickHouse SQL, so an internet-facing endpoint
+# lets anyone who finds the FQDN run arbitrary (and mutating) queries. Deploy
+# with internal ingress by default; PUBLIC=1 switches to external for a
+# throwaway public demo — front it with Container Apps auth for anything real.
+if [ "${PUBLIC:-}" = "1" ]; then
+  echo "!! PUBLIC=1: exposing an external endpoint that executes arbitrary SQL."
+  INGRESS=external
+else
+  INGRESS=internal
+fi
 PW=$(az acr credential show -n "${ACR}" --query "passwords[0].value" -o tsv)
 az containerapp create -g "${RG}" -n "${APP}" --environment "${ENVIRONMENT}" \
   --image "${ACR}.azurecr.io/chdb-analyst:v1" \
   --registry-server "${ACR}.azurecr.io" --registry-username "${ACR}" --registry-password "${PW}" \
   --cpu 2 --memory 4Gi --min-replicas 0 --max-replicas 3 \
-  --ingress external --target-port 8080 "${ENV_FLAG[@]}" -o none
+  --ingress "${INGRESS}" --target-port 8080 "${ENV_FLAG[@]}" -o none
 
 URL="https://$(az containerapp show -g "${RG}" -n "${APP}" \
   --query properties.configuration.ingress.fqdn -o tsv)"
-echo "==> service ${URL}"
+echo "==> service ${URL} (ingress: ${INGRESS})"
 
-python3 - "$URL" <<'EOF'
+if [ "${INGRESS}" = "external" ]; then
+  python3 - "$URL" <<'EOF'
 import sys, time, urllib.request
 url = sys.argv[1]
 t0 = time.time()
@@ -72,18 +89,28 @@ for _ in range(3):
     urllib.request.urlopen(f"{url}/health", timeout=30).read()
     print(f"==> warm hit: {(time.time()-t0)*1000:.0f} ms")
 EOF
+  cat <<EOF
 
-cat <<EOF
-
-Deployed. Talk to the analyst:
+Deployed (public). Talk to the analyst:
 
   curl -s ${URL}/query -H 'Content-Type: application/json' \\
     -d '{"sql": "SELECT RegionID, count() AS hits FROM demo.hits GROUP BY RegionID ORDER BY hits DESC LIMIT 5"}'
   curl -s ${URL}/ask -H 'Content-Type: application/json' \\
     -d '{"question": "Which regions drive the most traffic?"}'
+EOF
+else
+  cat <<EOF
+
+Deployed (internal ingress — reachable only inside the Container Apps
+environment's network, not from your laptop). Reach it from a workload in
+the same environment, or redeploy with PUBLIC=1 for a throwaway public URL.
+EOF
+fi
+
+cat <<EOF
 
 Scale-to-zero: with no traffic the replica count drops to 0 and compute
-stops billing; the next request pays the cold start you measured above.
+stops billing; the next request pays the cold start.
 
 Teardown: ./teardown.sh   (RESOURCE_GROUP=${RG})
 EOF

@@ -27,11 +27,15 @@ ACR="${ACR:-chdbanalyst$(printf '%s/%s' "${SUB}" "${RG}" | shasum | cut -c1-12)}
 echo "==> deleting registry ${ACR}"
 az acr delete -n "${ACR}" -g "${RG}" --yes -o none 2>/dev/null || echo "    (none)"
 
-# only remove the group if it's now empty — never destroy a shared group
-if [ "$(az resource list -g "${RG}" --query 'length(@)' -o tsv 2>/dev/null)" = "0" ]; then
-  echo "==> resource group ${RG} is empty — deleting it"
+# delete the group only if deploy.sh created it (its chdb-cookbook tag proves
+# ownership) and it's now empty — never destroy a pre-existing group, empty
+# or not
+OWNED=$(az group show -n "${RG}" --query "tags.\"chdb-cookbook\"" -o tsv 2>/dev/null)
+EMPTY=$(az resource list -g "${RG}" --query 'length(@)' -o tsv 2>/dev/null)
+if [ "${OWNED}" = "true" ] && [ "${EMPTY}" = "0" ]; then
+  echo "==> resource group ${RG} was created by deploy.sh and is empty — deleting it"
   az group delete -n "${RG}" --yes
 else
-  echo "==> resource group ${RG} still holds other resources — leaving it"
+  echo "==> leaving resource group ${RG} (not cookbook-created or not empty)"
 fi
 echo "done."
