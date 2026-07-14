@@ -1,4 +1,0 @@
-chdb>=4.2
-anthropic
-fastapi
-uvicorn
