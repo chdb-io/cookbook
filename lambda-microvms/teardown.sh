@@ -36,8 +36,15 @@ fi
 
 for role in "${NAME}-build-role" "${NAME}-exec-role"; do
   echo "==> deleting role ${role}"
-  aws iam delete-role-policy --role-name "${role}" --policy-name "${role}-policy" 2>/dev/null || true
-  aws iam delete-role --role-name "${role}" 2>/dev/null || echo "    (no role to delete)"
+  if aws iam get-role --role-name "${role}" >/dev/null 2>&1; then
+    # real failures (AccessDenied, DeleteConflict, throttling) abort loudly
+    if aws iam get-role-policy --role-name "${role}" --policy-name "${role}-policy" >/dev/null 2>&1; then
+      aws iam delete-role-policy --role-name "${role}" --policy-name "${role}-policy"
+    fi
+    aws iam delete-role --role-name "${role}"
+  else
+    echo "    (no role to delete)"
+  fi
 done
 
 echo "done."
