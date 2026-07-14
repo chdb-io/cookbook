@@ -38,10 +38,11 @@ if ! aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
     aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}" \
       --create-bucket-configuration "LocationConstraint=${REGION}"
   fi
-  aws s3api put-public-access-block --bucket "${BUCKET}" \
-    --public-access-block-configuration \
-    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 fi
+# enforce on every run, not just at creation, in case it was weakened since
+aws s3api put-public-access-block --bucket "${BUCKET}" \
+  --public-access-block-configuration \
+  "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 echo "==> bucket s3://${BUCKET}"
 
 # --- 2. IAM roles ------------------------------------------------------------

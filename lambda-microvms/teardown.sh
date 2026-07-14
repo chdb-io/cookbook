@@ -28,7 +28,11 @@ else
 fi
 
 echo "==> deleting bucket s3://${BUCKET}"
-aws s3 rb "s3://${BUCKET}" --force >/dev/null 2>&1 || echo "    (no bucket to delete)"
+if aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
+  aws s3 rb "s3://${BUCKET}" --force >/dev/null   # a real deletion error aborts loudly here
+else
+  echo "    (no bucket to delete)"
+fi
 
 for role in "${NAME}-build-role" "${NAME}-exec-role"; do
   echo "==> deleting role ${role}"
