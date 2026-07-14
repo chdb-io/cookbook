@@ -12,7 +12,7 @@ IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT}:microvm-image:${NAME}"
 
 echo "==> terminating MicroVMs of ${NAME}"
 for id in $(aws lambda-microvms list-microvms --region "${REGION}" \
-    --query "items[?contains(imageArn, ':microvm-image:${NAME}') && state != 'TERMINATED'].microvmId" \
+    --query "items[?imageArn == '${IMAGE_ARN}' && state != 'TERMINATED'].microvmId" \
     --output text); do
   echo "    terminate ${id}"
   aws lambda-microvms terminate-microvm --microvm-identifier "${id}" --region "${REGION}" >/dev/null || true
