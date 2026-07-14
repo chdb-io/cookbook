@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Remove everything deploy.sh created: MicroVMs, the image (versions incur
+# storage cost even with nothing running), the artifact bucket, and the roles.
+set -euo pipefail
+
+REGION="${REGION:-us-west-2}"
+NAME="${NAME:-chdb-sql-sandbox}"
+
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="${NAME}-artifacts-${ACCOUNT}-${REGION}"
+IMAGE_ARN="arn:aws:lambda:${REGION}:${ACCOUNT}:microvm-image:${NAME}"
+
+echo "==> terminating MicroVMs of ${NAME}"
+for id in $(aws lambda-microvms list-microvms --region "${REGION}" \
+    --query "items[?imageArn == '${IMAGE_ARN}' && state != 'TERMINATED'].microvmId" \
+    --output text); do
+  echo "    terminate ${id}"
+  aws lambda-microvms terminate-microvm --microvm-identifier "${id}" --region "${REGION}" >/dev/null || true
+done
+
+echo "==> deleting image ${IMAGE_ARN}"
+if aws lambda-microvms get-microvm-image --image-identifier "${IMAGE_ARN}" \
+     --region "${REGION}" >/dev/null 2>&1; then
+  aws lambda-microvms delete-microvm-image --image-identifier "${IMAGE_ARN}" \
+    --region "${REGION}" >/dev/null   # a real deletion error aborts loudly here
+else
+  echo "    (no image to delete)"
+fi
+
+echo "==> deleting bucket s3://${BUCKET}"
+if aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
+  aws s3 rb "s3://${BUCKET}" --force >/dev/null   # a real deletion error aborts loudly here
+else
+  echo "    (no bucket to delete)"
+fi
+
+for role in "${NAME}-build-role" "${NAME}-exec-role"; do
+  echo "==> deleting role ${role}"
+  if aws iam get-role --role-name "${role}" >/dev/null 2>&1; then
+    # real failures (AccessDenied, DeleteConflict, throttling) abort loudly
+    if aws iam get-role-policy --role-name "${role}" --policy-name "${role}-policy" >/dev/null 2>&1; then
+      aws iam delete-role-policy --role-name "${role}" --policy-name "${role}-policy"
+    fi
+    aws iam delete-role --role-name "${role}"
+  else
+    echo "    (no role to delete)"
+  fi
+done
+
+echo "done."
