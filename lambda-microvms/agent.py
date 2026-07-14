@@ -14,6 +14,7 @@ import sys
 import anthropic
 
 MODEL = os.getenv("AGENT_MODEL", "claude-opus-4-8")
+MAX_TOOL_ROUNDS = 12  # cap tool-use rounds so a runaway question can't burn budget
 
 SYSTEM = """You are a data analyst with an embedded ClickHouse engine (chDB) in your process.
 demo.hits holds web analytics events (the ClickBench dataset): one row per page hit, with
@@ -40,7 +41,7 @@ client = anthropic.Anthropic()
 def ask(question: str, history: list, execute_sql) -> str:
     """One analyst turn: history is mutated in place, execute_sql runs SQL -> str."""
     history.append({"role": "user", "content": question})
-    while True:
+    for _ in range(MAX_TOOL_ROUNDS):
         response = client.messages.create(
             model=MODEL, max_tokens=16000, system=SYSTEM, tools=TOOLS, messages=history)
         history.append({"role": "assistant", "content": response.content})
@@ -50,12 +51,16 @@ def ask(question: str, history: list, execute_sql) -> str:
         for block in response.content:
             if block.type == "tool_use":
                 try:
+                    out = execute_sql(block.input["sql"])
+                    if len(out) > 8000:  # keep tool payloads bounded; mark when clipped
+                        out = out[:8000] + "\n\u2026[truncated]"
                     results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": execute_sql(block.input["sql"])[:8000]})
+                                    "content": out})
                 except Exception as exc:
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": str(exc)[:2000], "is_error": True})
         history.append({"role": "user", "content": results})
+    return "Stopped after the maximum number of tool-use rounds without a final answer."
 
 
 if __name__ == "__main__":

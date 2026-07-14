@@ -4,6 +4,8 @@
 
 > *ClickHouse Cloud is where your data lives. chDB is what your agent thinks with. Lambda MicroVMs is where it gets to think — in private.*
 
+**Where this fits:** the exact same app runs *stateless* as a classic [Lambda container function](../aws-lambda/) — that recipe (and its [Cloud Run](../gcp-cloud-run/) and [Azure Container Apps](../azure-container-apps/) siblings — see [the series page](../serverless-analyst/)) is the plain serverless tier: bake the data into an image, scale to zero, pay per request, and let state die with the instance. This recipe is what Lambda MicroVMs adds **on top of that app, unchanged**: the platform snapshots the warm VM and suspends/resumes it with memory and disk intact, so every user keeps a private, stateful analyst. Google and Azure have equivalent snapshot tiers if you want the same upgrade there (GKE Agent Sandbox with Pod snapshots; Azure Container Apps Sandboxes) — and a portable, S3-backed take on statefulness (`chdb.durable`) is the planned 2.0 of this series.
+
 chDB is a named launch partner for AWS Lambda MicroVMs. For a full reference architecture on this combination (Bedrock agent, five-cloud federation, chat UI, CDK), see [nklmish/chdb-lambda-microvm-demo](https://github.com/nklmish/chdb-lambda-microvm-demo). This cookbook is the opposite end of the spectrum: the minimal version you can type yourself.
 
 ## Part 1 — the analyst, on your laptop
@@ -233,4 +235,5 @@ You pay for MicroVM runtime (suspended = free), image-version storage, the S3 ar
 - Bake more partitions: `BAKE_PARTITIONS=10` as a Docker build arg → 10M rows in the snapshot.
 - Point the federation demo at your own bucket, or join `postgresql()` dimension tables in the same statement.
 - Wire `/ask` into a real UI and one MicroVM per signed-in user — the [launch-partner demo](https://github.com/nklmish/chdb-lambda-microvm-demo) shows the full production shape.
-- Same analyst, other clouds: ports of this recipe to Azure Container Apps Sandboxes and GKE Agent Sandbox (the other two snapshot-based agent sandboxes) are coming next in this cookbook — `agent.py` runs unchanged on all three.
+- Same analyst, stateless: the serverless-function lanes run this exact app on classic [AWS Lambda](../aws-lambda/), [Google Cloud Run](../gcp-cloud-run/), and [Azure Container Apps](../azure-container-apps/).
+- Stateful per-user analysts with truly persistent memory — the engine's state living as a durable object on S3, portable across clouds — are the planned 2.0 of this series (`chdb.durable`).
