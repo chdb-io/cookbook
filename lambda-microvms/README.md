@@ -10,25 +10,15 @@ chDB is a named launch partner for AWS Lambda MicroVMs. For a full reference arc
 
 ## Part 1 — the analyst, on your laptop
 
-The whole "database tier" of this agent is `pip install chdb`. The engine runs inside the Python process, so the agent needs exactly one tool:
-
-```python
-TOOLS = [{
-    "name": "execute_sql",
-    "description": "Run one ClickHouse SQL statement on the in-process engine; returns JSON.",
-    "input_schema": {"type": "object",
-                     "properties": {"sql": {"type": "string"}},
-                     "required": ["sql"]},
-}]
-```
-
-[`agent.py`](agent.py) is the complete agent — a classic tool-use loop, 47 lines of code. Try it locally:
+The whole "database tier" of this agent is `pip install chdb`. The engine runs inside the Python process, so the agent needs exactly one tool — `execute_sql`. The complete analyst (that tool, the Claude tool-use loop, the store seam, and the dataset bake) is the published [`chdb-serverless`](https://pypi.org/project/chdb-serverless/) package, so there's nothing to copy:
 
 ```bash
-pip install chdb anthropic
-CHDB_DATA_PATH=./chdb-data python init_db.py       # bakes 1M rows of ClickBench web analytics (~18s, 122 MiB)
-CHDB_DATA_PATH=./chdb-data ANTHROPIC_API_KEY=sk-... python agent.py
+pip install "chdb-serverless[anthropic]"
+CHDB_DATA_PATH=./chdb-data python -m chdb_serverless.init_db    # bakes 1M rows of ClickBench (~18s, 122 MiB)
+CHDB_STORE=local:./chdb-data ANTHROPIC_API_KEY=sk-... python -m chdb_serverless.server   # /health /query /ask on :8080
 ```
+
+Ask it a question over `/ask` and you get the analyst below. The [package README](https://github.com/chdb-io/chdb-lambda) covers the `CHDB_MODEL` seam (Anthropic / OpenAI / Qwen / any OpenAI-compatible server) and importing the app directly (`from chdb_serverless import analyst_app`).
 
 ```
 chDB analyst ready — ask about demo.hits (Ctrl-D to exit)
@@ -69,21 +59,19 @@ That maps one-to-one onto what an embedded engine wants:
 
 ```
 lambda-microvms/
-├── agent.py       # Part 1 — the 50-line analyst, unchanged
-├── main.py        # one process, two ports: the app (:8080) + 6 lifecycle hooks (:9000)
-├── init_db.py     # build time: bake ClickBench partitions into MergeTree
-├── Dockerfile     # two-stage; snapshot-friendly
+├── main.py        # MicroVMs-specific: the package app (:8080) + 6 lifecycle hooks (:9000) in one process
+├── Dockerfile     # two-stage; pip installs chdb-serverless, bakes the store, snapshot-friendly
 ├── deploy.sh      # plain aws CLI: bucket → roles → image → run → smoke test
 └── teardown.sh    # remove everything deploy.sh created
 ```
 
-The one design decision worth copying is in [`main.py`](main.py): the app and the lifecycle hooks run as **two servers in one process**. Lambda builds your image by running the container, polling the `/ready` hook, and snapshotting the VM when it returns 200. Because our `/ready` warms the chDB store *in the same process the app serves from*, the snapshot contains a hot engine — every MicroVM launched from it answers its first query with zero initialization.
+The analyst (agent, endpoints, store, dataset bake) is the [`chdb-serverless`](https://pypi.org/project/chdb-serverless/) package — the Dockerfile `pip install`s it. The only code here is [`main.py`](main.py), and the one design decision worth copying is in it: the package's app and the MicroVMs lifecycle hooks run as **two servers in one process**, sharing the package's single chDB store. Lambda builds your image by running the container, polling the `/ready` hook, and snapshotting the VM when it returns 200. Because `/ready` warms that shared store *in the same process the app serves from*, the snapshot contains a hot engine — every MicroVM launched from it answers its first query with zero initialization.
 
 ```
 build time                                    run time (per user session)
 ──────────                                    ───────────────────────────
 docker build                                  run-microvm  ──▶ RUNNING (ms, from snapshot)
-  └─ init_db.py bakes 1M rows                   │  /query, /ask over dedicated HTTPS endpoint
+  └─ pip install + bake 1M rows                 │  /query, /ask over dedicated HTTPS endpoint
 container starts (app + hooks)                  │  idle 15 min ──▶ SUSPENDED (no compute charge)
   └─ POST /ready → warms chDB → 200             │  traffic ──▶ RUNNING (RAM + disk intact)
 Lambda snapshots the warm VM ──▶ image          └─ terminate (or 8h max) ──▶ gone
@@ -207,9 +195,8 @@ Same image, new VM: its own kernel, its own chDB, its own endpoint and tokens. N
 
 ## Adapt it to your workload
 
-- **Your data:** edit the `CREATE TABLE ... AS SELECT` in [`init_db.py`](init_db.py) — anything chDB can read works (S3/HTTP parquet & 80+ formats, `postgresql()`, `mysql()`, `iceberg()`, `deltaLake()`, local files shipped in the zip). Keep the baked store to what the snapshot should carry; reach for everything else live via table functions.
-- **Your API:** replace the endpoints in [`main.py`](main.py). Keep the two-servers-one-process shape and make `/ready` exercise whatever your app needs warm — that's what the snapshot captures.
-- **Your agent:** swap `demo.hits` and the schema note in `agent.py`'s system prompt. Or delete the agent layer and keep a plain SQL-over-HTTPS sandbox.
+- **Your data / your agent:** the analyst and its dataset bake live in the [`chdb-serverless`](https://github.com/chdb-io/chdb-lambda) package — fork it to change the baked `CREATE TABLE ... AS SELECT` or the agent's system prompt, then point this Dockerfile's `pip install` at your fork. chDB reaches S3/HTTP parquet, `postgresql()`, `mysql()`, `iceberg()`, `deltaLake()` live in the same SQL.
+- **Your hooks:** [`main.py`](main.py) is the only code here — keep the two-servers-one-process shape and make `/ready` exercise whatever your app needs warm; that's what the snapshot captures.
 - **CI runners / disposable sandboxes:** the same image works run-once — `run-microvm`, hit the endpoint, `terminate-microvm`. A clean, isolated chDB per test run with no shared staging server.
 
 ## Troubleshooting

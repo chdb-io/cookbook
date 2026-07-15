@@ -1,40 +1,40 @@
 """chDB on AWS Lambda MicroVMs — a private SQL engine per session.
 
-One Python process serves two HTTP ports:
+The analyst itself is the published `chdb-serverless` package: its FastAPI app
+(/health /query /ask over an embedded chDB store, with the pluggable-LLM
+agent). This file adds only what's specific to MicroVMs — a second server for
+the six lifecycle hooks, run in the *same process* as the app:
 
-  :8080  the application — a small SQL-over-HTTP API backed by an embedded
-         chDB (ClickHouse) engine with a persistent on-disk store. This is
-         the port the MicroVM proxy routes client traffic to.
+  :8080  the app (chdb_serverless.server.app) — the port the MicroVM proxy
+         routes client traffic to.
   :9000  the six Lambda MicroVMs lifecycle hooks, under the platform path
          prefix /aws/lambda-microvms/runtime/v1.
 
-The single-process design is deliberate: the /ready hook warms the chDB
-store *in this process* before the platform snapshots the VM, so the
-snapshot captures a hot engine. Every MicroVM launched from the image
-answers its first query warm — no engine init, no store load.
+The single-process design is deliberate: the /ready hook warms the chDB store
+*in this process* before the platform snapshots the VM, so the snapshot
+captures a hot engine. The hooks reuse the app's own store handle
+(`chdb_serverless.server._store`) — one engine, one session, warmed once.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import random
 import signal
 import sys
-import threading
-import time
 import uuid
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 
-import chdb
-from chdb import session as chdb_session
-
-import agent
+# The app and the exact store it serves from — reusing the store keeps this to
+# one chDB session (chDB is single-writer), so /ready warms what the app uses.
+# `pkgsrv` is imported as a module (not `from ... import _instance_id`) so a
+# reseed can rebind the app's per-instance id and have /health see it.
+import chdb_serverless.server as pkgsrv
+from chdb_serverless.server import app, _store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,93 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sql-sandbox")
 
-DATA_PATH = os.getenv("CHDB_DATA_PATH", "/app/chdb-data")
-APP_PORT = int(os.getenv("PORT", "8080"))
 HOOKS_PORT = int(os.getenv("MICROVM_HOOKS_PORT", "9000"))
 HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1"
-
-# One embedded engine per MicroVM, one session against the baked store.
-# chDB sessions are not thread-safe; FastAPI sync endpoints run in a thread
-# pool, so serialize engine access with a lock.
-_session = chdb_session.Session(DATA_PATH)
-_session_lock = threading.Lock()
 _boot_id = uuid.uuid4().hex
-_started_at = time.monotonic()
-
-# Formats whose output is JSON text we can embed directly in the response.
-_JSON_FORMATS = {"JSON", "JSONCompact", "JSONColumns", "JSONObjectEachRow"}
-
-
-def run_sql(sql: str, fmt: str = "JSONCompact") -> str:
-    with _session_lock:
-        return _session.query(sql, fmt).data()
-
-
-# ---------------------------------------------------------------------------
-# Application (:8080) — what clients reach through the MicroVM endpoint
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="chDB SQL sandbox")
-
-
-class QueryRequest(BaseModel):
-    sql: str
-    format: str = "JSONCompact"  # any ClickHouse output format
-
-
-@app.get("/health")
-def health() -> dict:
-    rows = run_sql("SELECT count() FROM demo.hits", "TabSeparated").strip()
-    return {
-        "status": "ok",
-        "engine": f"chdb {chdb.__version__}",
-        "baked_rows": int(rows),
-        "boot_id": _boot_id,
-        "uptime_s": round(time.monotonic() - _started_at, 1),
-    }
-
-
-# The conversation lives in this process. That is the point: one MicroVM per
-# user session, so suspend/resume preserves the analyst's memory (this list is
-# in the VM's RAM snapshot; materialized tables are on its disk).
-_history: list = []
-
-
-class AskRequest(BaseModel):
-    question: str
-
-
-@app.post("/ask")
-def ask(req: AskRequest):
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        return JSONResponse(
-            {"error": "ANTHROPIC_API_KEY not set; /ask is disabled (use /query for raw SQL)"},
-            status_code=503,
-        )
-    started = time.perf_counter()
-    try:
-        answer = agent.ask(req.question, _history, lambda sql: run_sql(sql) or "{}")
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=502)
-    return {
-        "answer": answer,
-        "turns": len(_history),
-        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-    }
-
-
-@app.post("/query")
-def query(req: QueryRequest):
-    started = time.perf_counter()
-    try:
-        raw = run_sql(req.sql, req.format)
-    except Exception as exc:  # chDB raises RuntimeError with the CH error text
-        return JSONResponse({"error": str(exc)}, status_code=400)
-    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-    if req.format in _JSON_FORMATS:
-        body = json.loads(raw) if raw else {}
-        return {"elapsed_ms": elapsed_ms, "result": body}
-    return PlainTextResponse(raw, headers={"X-Elapsed-Ms": str(elapsed_ms)})
 
 
 # ---------------------------------------------------------------------------
@@ -143,14 +59,14 @@ def _warm() -> int:
     """Touch the baked store so its pages are in memory when Lambda snapshots.
 
     Runs a real aggregation, not just a count: the platform samples which
-    memory pages the snapshot actually uses, so warming the same access
-    paths the app will use makes future launches faster.
+    memory pages the snapshot actually uses, so warming the same access paths
+    the app will use makes future launches faster.
     """
-    run_sql("SELECT count() FROM demo.hits")
-    run_sql(
+    _store.query("SELECT count() FROM demo.hits")
+    _store.query(
         "SELECT RegionID, count() FROM demo.hits GROUP BY RegionID ORDER BY 2 DESC LIMIT 10"
     )
-    return int(run_sql("SELECT count() FROM demo.hits", "TabSeparated").strip())
+    return int(_store.query("SELECT count() FROM demo.hits", "TabSeparated").strip())
 
 
 @hooks.post(f"{HOOK_PREFIX}/ready")
@@ -173,7 +89,7 @@ def ready():
 def validate():
     """Build-time check: exercise a representative query against the snapshot."""
     try:
-        run_sql(
+        _store.query(
             "SELECT EventDate, count() FROM demo.hits GROUP BY EventDate ORDER BY EventDate LIMIT 5"
         )
     except Exception as exc:
@@ -183,15 +99,20 @@ def validate():
 
 
 def _reseed(event: str) -> dict:
-    """Re-arm randomness after launch/resume.
+    """Re-arm randomness and per-instance identity after launch/resume.
 
     A snapshot freezes process memory, so every MicroVM launched from it
-    starts with identical RNG state. Reseed and mint a fresh boot id so each
-    instance is distinguishable and generates unique values.
+    starts with identical RNG state and a frozen instance id. Reseed and mint a
+    fresh boot id so each instance is distinguishable and generates unique
+    values. The app on :8080 reports identity via `/health` ("instance"), and
+    that value is baked into the snapshot too — so push the fresh id into the
+    package server's module global here, making a client's `/health` reflect
+    the live instance rather than the one captured at snapshot time.
     """
     global _boot_id
     random.seed()  # reseeds from os.urandom
     _boot_id = uuid.uuid4().hex
+    pkgsrv._instance_id = _boot_id[:8]
     logger.info("%s: new boot_id=%s", event, _boot_id)
     return {"status": "ok", "boot_id": _boot_id}
 
@@ -218,9 +139,9 @@ def on_suspend():
 
 @hooks.post(f"{HOOK_PREFIX}/terminate")
 def on_terminate():
-    logger.info("terminate: closing chDB session")
-    with _session_lock:
-        _session.close()
+    """Fires before the VM is destroyed. The store is durable on disk and the
+    process is about to exit, so there's nothing to flush — just log."""
+    logger.info("terminate: boot_id=%s", _boot_id)
     return {"status": "ok"}
 
 
@@ -230,8 +151,9 @@ def on_terminate():
 
 
 async def _serve() -> None:
+    app_port = int(os.getenv("PORT", "8080"))
     servers = [
-        uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=APP_PORT, log_level="info")),
+        uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=app_port, log_level="info")),
         uvicorn.Server(uvicorn.Config(hooks, host="0.0.0.0", port=HOOKS_PORT, log_level="info")),
     ]
     # uvicorn installs one signal handler per server and the second clobbers
@@ -248,7 +170,7 @@ async def _serve() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _stop)
 
-    logger.info("app on :%d, lifecycle hooks on :%d, store at %s", APP_PORT, HOOKS_PORT, DATA_PATH)
+    logger.info("app on :%d, lifecycle hooks on :%d", app_port, HOOKS_PORT)
     await asyncio.gather(*(server.serve() for server in servers))
 
 

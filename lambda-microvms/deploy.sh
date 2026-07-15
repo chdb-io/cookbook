@@ -105,7 +105,7 @@ echo "==> roles ${BUILD_ROLE}, ${EXEC_ROLE}"
 
 # --- 3. package + upload -----------------------------------------------------
 ZIP=$(mktemp -d)/app.zip
-zip -q -j "${ZIP}" Dockerfile main.py agent.py init_db.py requirements.txt
+zip -q -j "${ZIP}" Dockerfile main.py
 aws s3 cp --quiet "${ZIP}" "s3://${BUCKET}/app.zip"
 echo "==> uploaded s3://${BUCKET}/app.zip"
 
