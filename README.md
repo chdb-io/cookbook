@@ -28,6 +28,7 @@ Every notebook runs end-to-end with `pip install chdb` and the dependencies list
 
 ### agents
 - [Federated SQL for Claude Dynamic Workflows](dynamic-workflows/README.md) — give every subagent an in-process engine that joins S3, Postgres, ClickHouse, an HTTP API, and a DataFrame in one query.
+- [chDB on E2B: a stateful analytical database inside your agent's sandbox](e2b-sandbox/README.md) — a sandbox template with chdb prebaked, the pause/resume walkthrough (1M rows survive a snapshot, sub-second both ways), and `ChDBTool` wired into a tool-use loop.
 - [A data analyst agent with chDB in 50 lines — on AWS Lambda MicroVMs](lambda-microvms/README.md) — build a complete analyst agent (Claude + one `execute_sql` tool + chDB), then give every user their own Firecracker-isolated copy: snapshot-hot starts, suspend/resume with memory intact, one MicroVM per session. *(Deployment recipe; the agent also runs standalone on a laptop.)*
 - [One analyst, three clouds — chDB on serverless](serverless-analyst/README.md) — the series hub: the `chdb-serverless` package (one `pip install`) deployed as one image to AWS Lambda, Cloud Run, and Azure Container Apps, cold-start economics measured side by side, and where stateful lives.
 - [A data analyst agent with chDB — on Google Cloud Run](gcp-cloud-run/README.md) — the `chdb-serverless` analyst as a scale-to-zero Cloud Run container: idle = free, private by default, cold-start economics measured. *(App is `pip install chdb-serverless`.)*
