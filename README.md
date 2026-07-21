@@ -6,32 +6,22 @@ Short, focused, runnable examples that show one technique each — organized by 
 
 ## The map
 
-chDB is one thing — a full ClickHouse query engine inside your process (`pip install chdb`). The recipes are four ways to put it to work:
+chDB is one thing — a full ClickHouse query engine inside your process (`pip install chdb`) over local files, S3, Postgres, MySQL, ClickHouse, and DataFrames. The recipes split into two sides: the agent side, where chDB becomes a tool or deployed analyst, and the data-in side, where data is moved, enriched, or buffered.
 
-```
-                        ┌──────────────────────────────────────────┐
-                        │   chDB — in-process ClickHouse (pip)       │
-                        │   one engine: local files · S3 · Postgres  │
-                        │   · MySQL · ClickHouse · DataFrames        │
-                        └───────────────────┬────────────────────────┘
-        ┌───────────────────────┬───────────┴───────────┬───────────────────────┐
-        ▼                       ▼                       ▼                       ▼
- ┌───────────────┐     ┌───────────────┐       ┌───────────────┐       ┌───────────────┐
- │ GIVE AN AGENT │     │ DEPLOY AN     │       │ MIGRATE       │       │ INGEST &      │
- │ SQL HANDS     │     │ ANALYST       │       │ TO chDB       │       │ BUFFER        │
- │ (a tool in    │     │ (serverless — │       │               │       │               │
- │  your agent)  │     │  the ladder)  │       │               │       │               │
- └──────┬────────┘     └──────┬────────┘       └──────┬────────┘       └──────┬────────┘
-        │                     │                       │                       │
- agent-framework-chdb  serverless-analyst      migration-from-duckdb   otel-ingestion-buffer
- dspy-chdb             aws-lambda · gcp-cloud-run
- dynamic-workflows     azure-container-apps · lambda-microvms
-        │                     │
-        └──── the SAME chdb.agents.ChDBTool ────┘
-     build the agent with any framework  ×  deploy it on any tier
+```mermaid
+flowchart TB
+    Engine["chDB<br/>in-process ClickHouse<br/>pip install chdb"]
+
+    Engine --> AgentSide["Agent side<br/>build with a framework / deploy anywhere"]
+    Engine --> DataSide["Data-in side<br/>migrate into chDB / ingest into ClickHouse"]
+
+    AgentSide --> Build["Give agents SQL hands<br/>agent-framework-chdb / dspy-chdb / dynamic-workflows"]
+    AgentSide --> Deploy["Deploy a chDB analyst<br/>serverless-analyst / aws-lambda / gcp-cloud-run<br/>azure-container-apps / lambda-microvms"]
+    DataSide --> Migrate["Migrate to chDB<br/>migration-from-duckdb"]
+    DataSide --> Ingest["Ingest and buffer<br/>otel-ingestion-buffer"]
 ```
 
-The two agent columns are **orthogonal and compose**: the `execute_sql` tool the deploy recipes give their analyst is the *same* `chdb.agents.ChDBTool` the framework recipes wrap. Pick a framework to build with, pick a tier to run on — independently. Migration and ingestion are the *data-in* side and feed any of the above.
+The two agent paths are **orthogonal and compose**: the `execute_sql` tool in the deploy recipes is the same `chdb.agents.ChDBTool` wrapped by the framework recipes. Migration and ingestion are the data-in side and can feed any of the agent or deploy patterns above.
 
 ## Recipes by goal
 
@@ -42,38 +32,39 @@ The engine runs inside the agent's process, so the agent needs exactly one tool.
 - [Federated SQL for Claude Dynamic Workflows](dynamic-workflows/README.md) — give every subagent a federated chDB query that joins S3, Postgres, ClickHouse, an HTTP API, and a DataFrame in one statement, no server to stand up.
 
 ### Deploy a chDB analyst — serverless, and how far state lives
-One app (`chdb-serverless`, the ~50-line analyst); the store seam moves it up the [statefulness ladder](#the-serverless-statefulness-ladder).
+One app (`chdb-serverless`, the ~50-line analyst); one line, the store seam, decides how far state survives.
 - [One analyst, three clouds](serverless-analyst/README.md) — **the series hub**: the `chdb-serverless` package as one image on AWS Lambda, Cloud Run, and Azure Container Apps, cold-start economics side by side, and where stateful lives.
 - [on AWS Lambda](aws-lambda/README.md) — classic Lambda container function: per-request billing, Function URL (IAM-auth by default).
 - [on Google Cloud Run](gcp-cloud-run/README.md) — scale-to-zero container: idle = free, private by default.
 - [on Azure Container Apps](azure-container-apps/README.md) — scale-to-zero: server-side ACR build, internal ingress by default.
 - [on AWS Lambda MicroVMs](lambda-microvms/README.md) — a **private, warm** analyst per user: snapshot-hot starts, suspend/resume with memory intact, one Firecracker MicroVM per session.
 
+Use this ladder when choosing a deployment target. Climb a rung only when the use case needs it.
+
+```mermaid
+flowchart LR
+    L1["L1 stateless<br/>CHDB_STORE=local:<br/>aws-lambda / gcp-cloud-run / azure-container-apps"]
+    Snapshot["Platform snapshot<br/>local: + platform<br/>lambda-microvms / E2B / GKE / ACA snapshots"]
+    L2["L2 durable object<br/>CHDB_STORE=durable:<br/>durable-analytical-object planned"]
+    L3["L3 agent memory<br/>CHDB_STORE=memory:<br/>agent-memory planned"]
+
+    L1 --> Snapshot --> L2 --> L3
+```
+
+| Rung | Choose it when | Recipes |
+|---|---|---|
+| L1 stateless | You can rebuild or reload state on each instance, and scale-to-zero is the priority. | [aws-lambda](aws-lambda/README.md) / [gcp-cloud-run](gcp-cloud-run/README.md) / [azure-container-apps](azure-container-apps/README.md) |
+| Platform snapshot | One platform is enough and you want a warm in-process engine to survive suspend/resume. This still runs `local:`. | [lambda-microvms](lambda-microvms/README.md) today / E2B / GKE / ACA snapshot patterns |
+| L2 durable object | State must move across hosts or clouds, live in storage you own, or be queried across many objects. | `durable-analytical-object` planned |
+| L3 agent memory | The analyst needs memory semantics over durable analytical state. | `agent-memory` planned |
+
+> **Platform snapshot is not a store tier** — it keeps `local:` state by snapshotting the whole box (Firecracker snapshot, E2B `pause`, GKE Pod snapshot). L2/L3 move state out into storage you own, so it can be portable and federated across objects.
+
 ### Migrate to chDB
 - [Migrating from DuckDB to chDB](migration-from-duckdb/README.md) — runnable companion to the migration guide: the analyzer and an 18-query benchmark, including where a chDB `MergeTree` design choice trades off vs DuckDB.
 
 ### Ingest & buffer
 - [OTEL ingestion buffer in Node.js](otel-ingestion-buffer/README.md) — chDB as an off-heap ingestion buffer: read length-delimited protobuf off S3, enrich, and export to ClickHouse over the native protocol in one SQL statement — the rows never pass through JavaScript.
-
-## The serverless statefulness ladder
-
-The deploy recipes are one app; **one line — the store seam — picks how far state survives.** Climb a rung only when the use case needs it.
-
-```
-  L3  AGENT MEMORY        CHDB_STORE=memory:      recall / reflect / forget       agent-memory           [future]
-        ▲ adds memory semantics, built on L2
-  L2  DURABLE OBJECT      CHDB_STORE=durable:     your data as an object in        durable-analytical-    [future]
-        ▲ portable + your own storage             storage YOU own; portable        object
-                                                  across clouds; ns.scan()
-  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
-  PLATFORM SNAPSHOT       local: + platform       whole VM/sandbox frozen &        lambda-microvms
-        ▲ survives suspend/resume                 thawed; state on one host,       (e2b-sandbox, GKE/ACA
-          (platform-managed, single host)         in the platform's storage        snapshots)
-  L1  STATELESS           CHDB_STORE=local:       nothing — dies with the          aws-lambda · gcp-cloud-run
-                                                  instance (bake data, scale 0)    · azure-container-apps
-```
-
-> **Platform snapshot is not a store tier** — it still runs the `local:` tier and lets the *platform* snapshot the whole box (Firecracker snapshot, E2B `pause`, GKE Pod snapshot). L2/L3 are different: the store seam moves the state *out* into storage you own, so it is portable and federatable across objects. Use a snapshot when one platform is enough; use a durable object when you must move across hosts/clouds, own the storage, or query across many objects.
 
 ## Getting started
 
