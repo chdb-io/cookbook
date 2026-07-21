@@ -77,7 +77,7 @@ def main() -> int:
         print("E2B_API_KEY is not set — get one at https://e2b.dev/dashboard", file=sys.stderr)
         return 1
 
-    template = None if args.pip else os.environ.get("CHDB_TEMPLATE", "chdb")
+    template = None if args.pip else os.environ.get("CHDB_TEMPLATE", "shawns-default-team-95ec/chdb")
 
     sbx = timed(
         f"create sandbox (template={template or 'base'})",
