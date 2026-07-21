@@ -15,9 +15,13 @@ Prereqs: an [E2B account](https://e2b.dev/dashboard) (free tier is fine), then `
 
 ## Getting chDB into a sandbox
 
-**(a) Public `chdb` template — coming soon.** Once published, `Sandbox.create("chdb")` will work on any account with no build step. Until then:
+**(a) Use the public template** — no build step, works on any account:
 
-**(b) Build the template from `e2b.Dockerfile`** (needs the CLI: `npm i -g @e2b/cli && e2b auth login`):
+```python
+sbx = Sandbox.create(template="shawns-default-team-95ec/chdb")
+```
+
+**(b) Build your own from `e2b.Dockerfile`** (needs the CLI: `npm i -g @e2b/cli && e2b auth login`; afterwards it's `Sandbox.create(template="chdb")` under your team):
 
 ```bash
 e2b template create chdb --dockerfile e2b.Dockerfile \

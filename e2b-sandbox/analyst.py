@@ -4,7 +4,7 @@ Prints per-step timings, kills the sandbox at the end.
 
     pip install e2b-code-interpreter
     export E2B_API_KEY=e2b_...
-    python analyst.py            # prebuilt "chdb" template (build: see README)
+    python analyst.py            # public chdb template (or your own via CHDB_TEMPLATE)
     python analyst.py --pip      # base sandbox + runtime `pip install chdb` instead
     CHDB_TEMPLATE=x analyst.py   # custom template name
 """
