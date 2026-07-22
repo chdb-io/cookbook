@@ -16,7 +16,7 @@ flowchart TB
     Engine --> DataSide["Data-in side<br/>migrate into chDB / ingest into ClickHouse"]
 
     AgentSide --> Build["Give agents SQL hands<br/>agent-framework-chdb / dspy-chdb / dynamic-workflows"]
-    AgentSide --> Deploy["Deploy a chDB analyst<br/>serverless-analyst / aws-lambda / gcp-cloud-run<br/>azure-container-apps / lambda-microvms"]
+    AgentSide --> Deploy["Deploy a chDB analyst<br/>serverless-analyst / aws-lambda / gcp-cloud-run<br/>azure-container-apps / lambda-microvms / e2b-sandbox"]
     DataSide --> Migrate["Migrate to chDB<br/>migration-from-duckdb"]
     DataSide --> Ingest["Ingest and buffer<br/>otel-ingestion-buffer"]
 ```
@@ -38,6 +38,7 @@ One app (`chdb-serverless`, the ~50-line analyst); one line, the store seam, dec
 - [on Google Cloud Run](gcp-cloud-run/README.md) — scale-to-zero container: idle = free, private by default.
 - [on Azure Container Apps](azure-container-apps/README.md) — scale-to-zero: server-side ACR build, internal ingress by default.
 - [on AWS Lambda MicroVMs](lambda-microvms/README.md) — a **private, warm** analyst per user: snapshot-hot starts, suspend/resume with memory intact, one Firecracker MicroVM per session.
+- [in an E2B sandbox](e2b-sandbox/README.md) — the sandbox is the agent's stateful computer: a prebuilt public `chdb` template, 1M rows surviving `pause()`/resume sub-second both ways, and `ChDBTool` wired into a tool-use loop.
 
 Use this ladder when choosing a deployment target. Climb a rung only when the use case needs it.
 
@@ -54,7 +55,7 @@ flowchart LR
 | Rung | Choose it when | Recipes |
 |---|---|---|
 | L1 stateless | You can rebuild or reload state on each instance, and scale-to-zero is the priority. | [aws-lambda](aws-lambda/README.md) / [gcp-cloud-run](gcp-cloud-run/README.md) / [azure-container-apps](azure-container-apps/README.md) |
-| Platform snapshot | One platform is enough and you want a warm in-process engine to survive suspend/resume. This still runs `local:`. | [lambda-microvms](lambda-microvms/README.md) today / E2B / GKE / ACA snapshot patterns |
+| Platform snapshot | One platform is enough and you want a warm in-process engine to survive suspend/resume. This still runs `local:`. | [lambda-microvms](lambda-microvms/README.md) / [e2b-sandbox](e2b-sandbox/README.md) today; GKE / ACA snapshot patterns |
 | L2 durable object | State must move across hosts or clouds, live in storage you own, or be queried across many objects. | `durable-analytical-object` planned |
 | L3 agent memory | The analyst needs memory semantics over durable analytical state. | `agent-memory` planned |
 
