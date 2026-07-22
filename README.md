@@ -37,6 +37,10 @@ Every notebook runs end-to-end with `pip install chdb` and the dependencies list
 ### ingestion
 - [OTEL ingestion buffer in Node.js](otel-ingestion-buffer/README.md) — use chDB as an off-heap ingestion buffer in a Node.js service: zero-copy span ingestion (no `JSON.parse` on the main thread), engine-side enrichment, and native-protocol export — with flow control and failure/retry recipes. *(Node.js, not a Python notebook.)*
 
+### interop
+- [chDB over ADBC — quickstart](adbc-quickstart/README.md) — use chDB's experimental [ADBC](https://arrow.apache.org/adbc/) driver from any language via the standard driver manager (Python, C, Go, R verified end-to-end; Rust/Java patterns), plus how packaging changes from the rc preview to the stable `chdb[adbc]` packages. *(Cross-language, not a Python notebook.)*
+- [Validating the chDB ADBC driver](adbc-validation-report/README.md) — reproduce the driver's conformance under both the ADBC Driver Foundry suite ([adbc-foundry-validation/](adbc-foundry-validation/)) and apache/arrow-adbc's own C++ suite, with a comparison to other embedded engines.
+
 ## Contributing
 
 PRs welcome. To propose a notebook:

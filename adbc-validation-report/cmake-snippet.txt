@@ -1,0 +1,13 @@
+
+if(ADBC_BUILD_TESTS AND ADBC_DRIVER_MANAGER)
+  add_test_case(external_validation_test
+                PREFIX adbc
+                EXTRA_LABELS external-validation
+                SOURCES adbc_external_validation_test.cc
+                EXTRA_LINK_LIBS adbc_driver_common adbc_validation
+                                adbc_driver_manager_shared)
+  target_compile_features(adbc-external-validation-test PRIVATE cxx_std_17)
+  target_include_directories(adbc-external-validation-test SYSTEM
+                             PRIVATE ${REPOSITORY_ROOT}/c/ ${REPOSITORY_ROOT}/c/include/
+                                     ${REPOSITORY_ROOT}/c/driver)
+endif()
