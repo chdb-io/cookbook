@@ -47,6 +47,12 @@ chDB durable adds the missing part: that local analytical brain should not disap
 
 chDB durable is an addressable, single-writer, recoverable embedded analytical object.
 
+Install chDB with the durable extra before using an object-storage backend:
+
+```bash
+pip install "chdb[durable]"
+```
+
 A Python developer can open one like this:
 
 ```python
