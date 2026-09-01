@@ -39,6 +39,7 @@ One app (`chdb-serverless`, the ~50-line analyst); one line, the store seam, dec
 - [on Azure Container Apps](azure-container-apps/README.md) — scale-to-zero: server-side ACR build, internal ingress by default.
 - [on AWS Lambda MicroVMs](lambda-microvms/README.md) — a **private, warm** analyst per user: snapshot-hot starts, suspend/resume with memory intact, one Firecracker MicroVM per session.
 - [in an E2B sandbox](e2b-sandbox/README.md) — the sandbox is the agent's stateful computer: a prebuilt public `chdb` template, 1M rows surviving `pause()`/resume sub-second both ways, and `ChDBTool` wired into a tool-use loop.
+- [Durable local agent memory with chDB](durable-agent-memory/README.md) — the missing middle store tier: embedded chDB/MergeTree for hot analytical reads, object storage for recoverable state, no database server or sidecar required.
 
 Use this ladder when choosing a deployment target. Climb a rung only when the use case needs it.
 
@@ -46,7 +47,7 @@ Use this ladder when choosing a deployment target. Climb a rung only when the us
 flowchart LR
     L1["L1 stateless<br/>CHDB_STORE=local:<br/>aws-lambda / gcp-cloud-run / azure-container-apps"]
     Snapshot["Platform snapshot<br/>local: + platform<br/>lambda-microvms / E2B / GKE / ACA snapshots"]
-    L2["L2 durable object<br/>CHDB_STORE=durable:<br/>durable-analytical-object planned"]
+    L2["L2 durable object<br/>CHDB_STORE=durable:<br/>durable-agent-memory"]
     L3["L3 agent memory<br/>CHDB_STORE=memory:<br/>agent-memory planned"]
 
     L1 --> Snapshot --> L2 --> L3
@@ -56,7 +57,7 @@ flowchart LR
 |---|---|---|
 | L1 stateless | You can rebuild or reload state on each instance, and scale-to-zero is the priority. | [aws-lambda](aws-lambda/README.md) / [gcp-cloud-run](gcp-cloud-run/README.md) / [azure-container-apps](azure-container-apps/README.md) |
 | Platform snapshot | One platform is enough and you want a warm in-process engine to survive suspend/resume. This still runs `local:`. | [lambda-microvms](lambda-microvms/README.md) / [e2b-sandbox](e2b-sandbox/README.md) today; GKE / ACA snapshot patterns |
-| L2 durable object | State must move across hosts or clouds, live in storage you own, or be queried across many objects. | `durable-analytical-object` planned |
+| L2 durable object | State must move across hosts or clouds, live in storage you own, or be queried across many objects. | [durable-agent-memory](durable-agent-memory/README.md) |
 | L3 agent memory | The analyst needs memory semantics over durable analytical state. | `agent-memory` planned |
 
 > **Platform snapshot is not a store tier** — it keeps `local:` state by snapshotting the whole box (Firecracker snapshot, E2B `pause`, GKE Pod snapshot). L2/L3 move state out into storage you own, so it can be portable and federated across objects.
@@ -76,7 +77,7 @@ cd cookbook
 jupyter lab
 ```
 
-Every recipe runs end-to-end with `pip install chdb` and the dependencies listed in its README/first cell — no external services required (except where a recipe explicitly federates to ClickHouse Cloud or deploys to a cloud).
+Every runnable recipe runs end-to-end with `pip install chdb` and the dependencies listed in its README/first cell — no external services required except where a recipe explicitly federates to ClickHouse Cloud, deploys to a cloud, or uses object storage for durable state.
 
 ## Conventions
 

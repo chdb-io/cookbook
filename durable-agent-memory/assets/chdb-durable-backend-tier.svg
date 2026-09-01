@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560" role="img" aria-labelledby="title desc">
+  <title id="title">chDB durable as the middle deployment tier</title>
+  <desc id="desc">A comparison of local backend, chDB durable backend, and server backend for agent memory deployment.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000000" flood-opacity="0.14"/>
+    </filter>
+    <style>
+      .bg { fill: #ffffff; }
+      .headline { font: 700 32px Arial, sans-serif; fill: #111111; }
+      .sub { font: 400 17px Arial, sans-serif; fill: #333333; }
+      .card { fill: #ffffff; stroke: #111111; stroke-width: 2.5; filter: url(#shadow); }
+      .durable { fill: #ffcc01; stroke: #111111; stroke-width: 2.5; filter: url(#shadow); }
+      .name { font: 700 24px Arial, sans-serif; fill: #111111; }
+      .desc { font: 400 15px Arial, sans-serif; fill: #222222; }
+      .pill { font: 700 13px Arial, sans-serif; fill: #111111; }
+      .pillDark { font: 700 13px Arial, sans-serif; fill: #ffcc01; }
+      .muted { font: 400 14px Arial, sans-serif; fill: #333333; }
+      .line { stroke: #111111; stroke-width: 2; }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="560"/>
+  <rect x="0" y="0" width="1200" height="16" fill="#ffcc01"/>
+  <text x="70" y="72" class="headline">The missing middle tier</text>
+  <text x="70" y="106" class="sub">Recover local analytical memory across hosts without introducing a heavy server backend.</text>
+
+  <rect x="70" y="160" width="312" height="306" rx="10" class="card"/>
+  <text x="108" y="214" class="name">Local backend</text>
+  <rect x="108" y="238" width="104" height="28" rx="4" fill="#111111"/>
+  <text x="133" y="257" class="pillDark">Laptop</text>
+  <line x1="108" y1="292" x2="344" y2="292" class="line"/>
+  <text x="108" y="326" class="desc">Fast local reads</text>
+  <text x="108" y="354" class="desc">No server</text>
+  <text x="108" y="382" class="desc">Tied to one disk</text>
+  <text x="108" y="424" class="muted">Best for single-machine</text>
+  <text x="108" y="448" class="muted">workflows</text>
+
+  <rect x="444" y="134" width="312" height="356" rx="10" class="durable"/>
+  <rect x="464" y="154" width="272" height="330" rx="8" fill="#ffffff" stroke="#111111" stroke-width="2.5"/>
+  <text x="500" y="208" class="name">chDB durable</text>
+  <rect x="500" y="232" width="144" height="28" rx="4" fill="#ffcc01" stroke="#111111" stroke-width="2"/>
+  <text x="519" y="251" class="pill">Object storage</text>
+  <line x1="500" y1="288" x2="700" y2="288" class="line"/>
+  <text x="500" y="322" class="desc">Fast local analytical reads</text>
+  <text x="500" y="350" class="desc">S3/GCS/R2 durable state</text>
+  <text x="500" y="378" class="desc">No database server</text>
+  <text x="500" y="406" class="desc">No PVC or sidecar</text>
+  <text x="500" y="434" class="muted">Best for CI, sandboxes,</text>
+  <text x="500" y="456" class="muted">and cross-machine memory</text>
+
+  <rect x="818" y="160" width="312" height="306" rx="10" class="card"/>
+  <text x="856" y="214" class="name">Server backend</text>
+  <rect x="856" y="238" width="104" height="28" rx="4" fill="#111111"/>
+  <text x="881" y="257" class="pillDark">Cluster</text>
+  <line x1="856" y1="292" x2="1092" y2="292" class="line"/>
+  <text x="856" y="326" class="desc">Multi-writer</text>
+  <text x="856" y="354" class="desc">Centralized operations</text>
+  <text x="856" y="382" class="desc">Requires a running service</text>
+  <text x="856" y="424" class="muted">Best for production teams</text>
+  <text x="856" y="448" class="muted">and shared data</text>
+</svg>

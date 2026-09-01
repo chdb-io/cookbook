@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">chDB durable architecture overview</title>
+  <desc id="desc">An agent writes memory and events into local chDB, flushes durable state to object storage, and restores the same analytical brain on another host.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="9" flood-color="#000000" flood-opacity="0.16"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#111111"/>
+    </marker>
+    <style>
+      .bg { fill: #ffffff; }
+      .title { font: 700 34px Arial, sans-serif; fill: #111111; }
+      .subtitle { font: 400 18px Arial, sans-serif; fill: #333333; }
+      .label { font: 700 21px Arial, sans-serif; fill: #111111; }
+      .small { font: 400 15px Arial, sans-serif; fill: #333333; }
+      .tiny { font: 700 13px Arial, sans-serif; fill: #111111; }
+      .box { fill: #ffffff; stroke: #111111; stroke-width: 2.5; filter: url(#shadow); }
+      .accent { fill: #ffcc01; stroke: #111111; stroke-width: 2.5; }
+      .soft { fill: #fff7cc; stroke: #111111; stroke-width: 2.5; }
+      .arrow { stroke: #111111; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dash { stroke: #111111; stroke-width: 3; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect class="bg" width="1200" height="620"/>
+  <rect x="0" y="0" width="1200" height="16" fill="#ffcc01"/>
+  <text x="70" y="78" class="title">A portable analytical brain for agents</text>
+  <text x="70" y="112" class="subtitle">Hot queries stay local. Durable state lives in object storage.</text>
+  <text x="70" y="138" class="subtitle">Restore the same brain anywhere.</text>
+
+  <rect x="70" y="188" width="248" height="188" rx="10" class="soft"/>
+  <text x="104" y="242" class="label">Agent runtime</text>
+  <text x="104" y="280" class="small">LLM turns</text>
+  <text x="104" y="308" class="small">Tool calls</text>
+  <text x="104" y="336" class="small">Memory commits</text>
+
+  <rect x="430" y="150" width="330" height="250" rx="10" class="accent"/>
+  <rect x="448" y="168" width="294" height="214" rx="8" class="box"/>
+  <text x="486" y="222" class="label">Local chDB</text>
+  <text x="486" y="260" class="small">MergeTree working copy</text>
+  <text x="486" y="288" class="small">Embeddings + filters</text>
+  <text x="486" y="316" class="small">History + traces + audit</text>
+  <text x="486" y="344" class="small">SQL reflection in-process</text>
+
+  <rect x="888" y="168" width="270" height="232" rx="10" class="soft"/>
+  <text x="926" y="222" class="label">Object storage</text>
+  <text x="926" y="260" class="small">head.json</text>
+  <text x="926" y="288" class="small">base checkpoint</text>
+  <text x="926" y="316" class="small">WAL segments</text>
+  <text x="926" y="344" class="small">single-writer lease</text>
+
+  <path d="M318 284 L430 284" class="arrow"/>
+  <text x="345" y="262" class="tiny">write events</text>
+
+  <path d="M760 246 L888 246" class="arrow"/>
+  <text x="804" y="224" class="tiny">flush</text>
+
+  <path d="M888 330 L760 330" class="dash"/>
+  <text x="778" y="362" class="tiny">restore</text>
+
+  <rect x="410" y="456" width="386" height="118" rx="10" class="soft"/>
+  <text x="454" y="500" class="label">Millisecond local reads</text>
+  <text x="454" y="528" class="small">Recall, reflection, batch retrieval,</text>
+  <text x="454" y="552" class="small">and SQL analysis stay in-process</text>
+
+  <path d="M595 400 L595 456" class="arrow"/>
+</svg>
