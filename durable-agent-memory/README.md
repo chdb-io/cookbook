@@ -123,13 +123,14 @@ Three things fell out of running this way that we had not fully priced in.
 
 ```sql
 -- event types, straight off the raw files: 1.45 GB, no import, 0.22 s
+-- (file() does not expand ~, so spell out your home directory)
 SELECT JSONExtractString(json, 'type') AS type, count() AS n
-FROM file('~/.claude/projects/**/*.jsonl', JSONAsString)
+FROM file('/Users/you/.claude/projects/**/*.jsonl', JSONAsString)
 GROUP BY type ORDER BY n DESC;
 
 -- grep, but with a query planner: 0.14 s
 SELECT count()
-FROM file('~/.claude/projects/**/*.jsonl', JSONAsString)
+FROM file('/Users/you/.claude/projects/**/*.jsonl', JSONAsString)
 WHERE json LIKE '%MergeTree%';
 ```
 
@@ -141,7 +142,7 @@ Other people have noticed the same thing. [`ccsql`](https://github.com/Subara3/c
 
 These come from building on it ourselves, and from watching the projects in the next section.
 
-**Model memory as append-heavy tables, not a document.** The tables that keep paying for themselves are: `memories` (current beliefs), `memory_history` (every revision as a new row), `raw_evidence` (transcripts and tool output kept cold), `recall_traces` (what was retrieved, for which query, and whether it helped), `conflicts` (semantically close rows that disagree), and `tool_events`. Append rows with a `version` or timestamp, soft-delete with a flag, and derive "current state" with `LIMIT 1 BY memory_id`. The agents post above walks through the schema and the three queries (current state, full history, point-in-time) that fall out of it.
+**Model memory as append-heavy tables, not a document.** The tables that keep paying for themselves are: `memories` (current beliefs), `memory_history` (every revision as a new row), `raw_evidence` (transcripts and tool output kept cold), `recall_traces` (what was retrieved, for which query, and whether it helped), `conflicts` (semantically close rows that disagree), and `tool_events`. Append rows with a `version` or timestamp, soft-delete with a flag, and derive "current state" with `ORDER BY version DESC LIMIT 1 BY memory_id`. The agents post above walks through the schema and the three queries (current state, full history, point-in-time) that fall out of it.
 
 **Keep raw evidence cold, compressed, and free of blobs.** Put transcripts and tool output in `raw_evidence` with `CODEC(ZSTD(3))`; text compresses about 4× there, and nobody reads it on the hot path. Store screenshots and other binary payloads out of line (in the bucket, referenced by key), or they will dominate every checkpoint. Keep the columns you actually filter and group on typed and `LowCardinality` where it fits, so the hot queries never touch the JSON column.
 
