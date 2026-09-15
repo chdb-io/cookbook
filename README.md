@@ -39,7 +39,7 @@ One app (`chdb-serverless`, the ~50-line analyst); one line, the store seam, dec
 - [on Azure Container Apps](azure-container-apps/README.md) — scale-to-zero: server-side ACR build, internal ingress by default.
 - [on AWS Lambda MicroVMs](lambda-microvms/README.md) — a **private, warm** analyst per user: snapshot-hot starts, suspend/resume with memory intact, one Firecracker MicroVM per session.
 - [in an E2B sandbox](e2b-sandbox/README.md) — the sandbox is the agent's stateful computer: a prebuilt public `chdb` template, 1M rows surviving `pause()`/resume sub-second both ways, and `ChDBTool` wired into a tool-use loop.
-- [Durable local agent memory with chDB](durable-agent-memory/README.md) — the missing middle store tier: embedded chDB/MergeTree for hot analytical reads, object storage for recoverable state, no database server or sidecar required.
+- [Durable agent memory with chDB](durable-agent-memory/README.md) — a runnable memory workflow with local recall, object-storage recovery, revision history, and cross-language API mappings.
 
 Use this ladder when choosing a deployment target. Climb a rung only when the use case needs it.
 

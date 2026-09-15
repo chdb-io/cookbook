@@ -1,206 +1,392 @@
-# Durable local agent memory with chDB
+# Agent memory that survives the machine
 
-**What you'll learn:** why local agent memory turns into an analytics problem, how the usual durability options (SQLite, Litestream, Postgres, Durable Objects, DuckDB) fit and where they stop, and how chDB durable keeps hot queries in-process while the authoritative copy lives in object storage you own. Includes best practices, SQL straight over raw JSONL transcripts, and a worked example from [ClickMem](https://github.com/auxten/clickmem).
+An agent learns a project rule during a deployment task:
 
-![chDB durable architecture overview](assets/chdb-durable-architecture.svg)
+> Deploy `checkout-api` to `eu-west-1`.
 
-## The state that didn't come back
+It uses the rule, finishes the task, and exits. The next job starts in CI on another machine. The repository is there, but the first agent's local database is not.
 
-Here is how it started for us.
+[chDB Durable](https://github.com/chdb-io/chdb/blob/main/docs/durable/index.mdx) makes that local database recoverable on another machine without adding a cloud database server. chDB still runs inside the agent process, and recall queries read a working copy on the current machine. Object storage holds the committed checkpoints, WAL segments, and coordination metadata. When another process opens the same object, Durable restores the database locally before returning it.
 
-We were building agent memory on top of chDB. A coding agent ran for weeks on one laptop, and the embedded database quietly filled up: project rules, user preferences, decisions that had been revised twice, the raw transcripts behind those decisions, and a trail of which memories had been recalled for which task. It was a good setup. Recall was a local query. Nothing left the machine.
+This recipe uses a small data model based on [ClickMem](https://github.com/auxten/clickmem). It records one decision, closes the database, opens it again, recalls the decision, revises it, and prints both versions.
 
-Then the work moved. A CI job needed the same memory. A sandbox spun up, did an hour of useful work, and was torn down. A second laptop showed up. Every time, the answer was the same: the memory lived in one MergeTree directory on one disk, and the disk was somewhere else.
+![Local chDB is the working copy; object storage holds the recoverable state](assets/chdb-durable-architecture.svg)
 
-The obvious fix is "use a database with a server." That fixes portability and breaks everything we liked. Recall goes back over the network. Every tool call pays a round trip. We now run, or rent, a service to hold what used to be a directory.
+## Run the story
 
-The second obvious fix is "just use SQLite." SQLite is excellent at being a durable local state file, and nearly every agent framework ships a SQLite-backed checkpointer or memory store, so the pattern is familiar. But we had stopped asking key-value questions a long time ago. We were asking history questions:
-
-- How was this memory created, and from which transcript?
-- Which memories were recalled last month and never helped?
-- Which belief replaced an older one, and when?
-- Did a failed tool call produce a bad memory?
-- Which project rules kept the agent from repeating a mistake?
-
-Filtering, grouping, ranking, joining, auditing, batch retrieval. Those are OLAP-shaped questions. In [chDB as the Agent's Local Data Engine](https://clickhouse.com/blog/chdb-agents-local-data-engine) we made the case that memory, traces, and conversation history are all the same append-heavy, queryable dataset, and that "recall is a query, not a bigger prompt." Vector search is one index over that dataset, not the dataset itself.
-
-So the problem sharpened into one sentence: we wanted a local analytical database whose state could survive the host.
-
-That is what chDB durable is for.
-
-## How people handle this today
-
-None of the existing answers are wrong. chDB durable only makes sense if we are honest about what each of them does well, and where it stops for this particular problem.
-
-**SQLite-backed checkpointers and memory stores in agent frameworks.** The most common starting point, and a good one. Nearly every framework ships one: LangGraph's `SqliteSaver`, the OpenAI Agents SDK's `SQLiteSession`, CrewAI's memory directory (LanceDB under `./.crewai/memory`), and dedicated memory layers such as Letta (SQLite by default on a pip install) and mem0 (a local vector store plus a SQLite history file). A checkpointer persists run state so an agent can resume; a memory store keeps facts across sessions. Small, transactional, embedded, mature. What they do not do is analytical computation over memory history, traces, embeddings, and event streams. They are built for point reads and writes of application state, and they are tied to one file or directory on one disk.
-
-**SQLite + Litestream.** Litestream continuously replicates the SQLite WAL to object storage, which solves the "one disk" problem. On Kubernetes that usually means a StatefulSet, a PersistentVolumeClaim, a restore init container, and a Litestream sidecar. It is a solid backup-and-restore architecture. You are still operating an OLTP database plus a replication process, and the analytical gap is unchanged.
-
-**Postgres, pgvector, server ClickHouse, and managed memory services such as the mem0 platform or Zep Cloud.** The right answer for team-scale, multi-writer, always-on deployments. Shared access, central operations, real concurrency. The cost is that the agent now depends on a remote service: network calls, connection management, credentials, and someone running the thing. For a per-user, per-project memory that mostly lives on one machine at a time, that is a lot of infrastructure to buy a durable copy.
-
-**Cloudflare Durable Objects.** An elegant model: each object has an identity, single-threaded execution, and durable storage attached. That identity-plus-single-writer shape is close to what we wanted. But it is coupled to one platform, and the storage is oriented toward application state, not embedded columnar analytics.
-
-**DuckDB, or plain chDB on local disk.** Fast local OLAP, no server, great developer experience. This is exactly the hot path we wanted to keep. The only problem is the one we started with: the state is a directory on one disk.
-
-| Approach | Compute | Durability | Analytics | Ops weight | Writers |
-|---|---|---|---|---|---|
-| SQLite-backed agent checkpointers / memory stores | in-process | one local file | row store, not built for scans or vectors | none | one process |
-| SQLite + Litestream | in-process | WAL streamed to object storage | same as SQLite | sidecar, PVC/StatefulSet | one process |
-| Postgres / pgvector / server ClickHouse / managed memory | remote service | handled by the service | OLTP + pgvector, or full OLAP | run or rent a service; network on the hot path | many |
-| Cloudflare Durable Objects | platform | platform | app-state storage | platform coupling | one per object |
-| DuckDB / plain chDB on disk | in-process | one local disk | full columnar OLAP | none | one process |
-| chDB durable | in-process | object storage you own; explicit `flush()` / `checkpoint()` | full columnar OLAP (MergeTree) | a bucket | one writer per object, enforced by lease |
-
-The last row is the gap we were trying to fill: keep the in-process OLAP hot path, move the authoritative copy into storage you already own, and do it without a server, a PVC, or a sidecar.
-
-## chDB durable: a local working copy, an authoritative copy in your bucket
-
-![chDB durable as the missing middle deployment tier](assets/chdb-durable-backend-tier.svg)
-
-chDB durable is an addressable, single-writer, recoverable embedded analytical object. Each object is a full chDB database. You open it by name inside a namespace, query it locally, and decide when its state becomes durable.
-
-Install chDB 4.3 or later with the durable extra (this brings in the S3 backend; GCS and Azure Blob are separate extras, see below):
+Python Durable is available in chDB 4.4.0. Install it and run the included script:
 
 ```bash
-pip install "chdb[durable]"
+python -m pip install "chdb[durable]>=4.4.0"
+python agent_memory.py demo
 ```
 
-Open an object and use it:
+The demo uses `local:/tmp/chdb-durable-agent-memory` and creates a new object on every run. It closes and reopens that object between steps, which exercises checkpoint restore and WAL replay on one host.
+
+The output ends with the revised memory and its history:
+
+```text
+{"content":"Deploy checkout-api to eu-central-1.", ...}
+
+┌─version─┬─op─────┬─content──────────────────────────────────┐
+│       1 │ expand │ Deploy checkout-api to eu-west-1.       │
+│       2 │ revise │ Deploy checkout-api to eu-central-1.    │
+└─────────┴────────┴──────────────────────────────────────────┘
+```
+
+To recover the same object on another machine, configure both machines with the same object-storage namespace and object ID:
+
+```bash
+export CHDB_DURABLE_URL=s3://my-agent-state/agent-memory
+export AWS_REGION=eu-west-1
+export CHDB_DURABLE_OBJECT_ID=acme-checkout-api
+```
+
+On machine A, create the tables and commit the first memory:
+
+```bash
+python agent_memory.py init
+python agent_memory.py remember
+```
+
+Wait for `remember` to print `remembered after durable flush`. The checkpoint and WAL are now committed. On machine B, restore the object, recall the memory, revise it, and inspect its history:
+
+```bash
+python agent_memory.py recall
+python agent_memory.py revise
+python agent_memory.py history
+```
+
+Machine B must use the same three environment variables and the same AWS identity or an identity with access to that prefix. Keep credentials out of the namespace URL. For MinIO, R2, or another S3-compatible provider, set `CHDB_DURABLE_S3_ENDPOINT`.
+
+The complete example is in [`agent_memory.py`](agent_memory.py).
+
+## How Durable maps to this example
+
+A namespace names a storage root. An object is one complete chDB database below that root.
+
+```text
+s3://my-agent-state/agent-memory   namespace
+└── acme-checkout-api             object: one database, one writer at a time
+```
+
+Object IDs are one flat path segment, so this recipe uses `acme-checkout-api`. Put hierarchy such as organization and environment in the namespace prefix.
+
+The API has six operations to remember:
+
+| Call | What has happened when it returns |
+|---|---|
+| `open()` | The latest checkpoint has been restored and committed WAL segments have been replayed |
+| `query()` | One read-only statement ran against the local working copy |
+| `execute()` | One mutation ran locally and entered the in-memory WAL buffer |
+| `flush()` | The buffered statements and the new head have been committed to object storage |
+| `checkpoint()` | A full database snapshot has become the new base; the committed WAL list is empty |
+| `close()` | Remaining writes were flushed, the writer lease was released, and local scratch data was cleaned up |
+
+The distinction between `execute()` and `flush()` affects user-visible behavior. If an agent says "I will remember that" after `execute()`, the statement can still disappear with the host. The tool should return success after `flush()`:
 
 ```python
-from chdb import durable as cd
-
-ns = cd.Namespace("s3://my-bucket/agent-memory", owner="worker-1")
-brain = ns.open("user-123")
-
-brain.execute("INSERT INTO mem.beliefs VALUES (...)")
-brain.flush()        # recent writes are now in object storage
-brain.checkpoint()   # fold the log into a fresh base snapshot
-brain.close()
+obj.execute("INSERT INTO memories VALUES (...)")
+wal_key = obj.flush()
+print(f"remembered after durable flush: {wal_key}")
 ```
 
-Under that small surface, the design has five parts.
+`checkpoint()` is also a durability boundary. It captures the current database, including statements still in the buffer.
 
-**A local MergeTree working copy.** Queries run against an embedded chDB database on local disk. No remote round trip on the hot path. chDB uses the same on-disk format as ClickHouse Local, so the working copy is an ordinary ClickHouse database directory, not a proprietary cache (see [chDB joins the ClickHouse family](https://clickhouse.com/blog/chdb-joins-clickhouse-family)).
+## The memory tables
 
-**Object storage as the authoritative state.** The copy that counts lives in a bucket you own. As of chDB 4.3, `s3://` is the primary backend: `chdb[durable]` pulls in boto3, and any S3-compatible store that honors conditional `PutObject` works by pointing `CHDB_DURABLE_S3_ENDPOINT` at it; the test suite runs against MinIO, and Cloudflare R2 implements the same `If-Match` / `If-None-Match` headers. Native `gcs://` and `azure://` backends ship behind the `chdb[durable-gcs]` and `chdb[durable-azure]` extras, using GCS generation preconditions and Azure ETag matches for the same compare-and-swap, but they are not yet exercised by the automated tests. A `local:` backend exists for development and single-host use only. Whatever the backend, a new machine opens the object by name and rebuilds the working copy from there.
+ClickMem separates reviewed memory from the material that produced it. The current implementation has six tables:
 
-**`flush()` as the durability boundary.** Writes are local until you say otherwise. When `flush()` returns, the writes it covered have reached object storage. The application decides where that boundary goes, which matters for a workload that arrives as a trickle of small batches.
+| Table | Contents |
+|---|---|
+| `memories` | The current version of each belief |
+| `memory_history` | An immutable row for every expand, revise, contract, pin, and resolve operation |
+| `projects` | Project metadata and permitted cross-project recall |
+| `blacklist` | Patterns that must not enter memory |
+| `raw_transcripts` | Cold evidence that is searchable but is never recalled automatically |
+| `events` | Mutation, integration, and recall audit events |
 
-**`checkpoint()` to fold the log.** Between checkpoints, durable state is a base snapshot plus a write-ahead log. `checkpoint()` produces a new base so a future open does not have to replay a long log.
+ClickMem does not use a separate `conflicts` table. A conflicting memory has `status='conflicted'` and IDs in `conflict_with`. Recall scoring is calculated when requested. The `events` table stores `recall.run` records with a query preview and the IDs that matched.
 
-**`head.json` plus conditional writes for the lease.** Each object has a head record in the bucket. Ownership is taken and advanced with compare-and-swap writes against that record, which gives you a single-writer lease and fencing: two processes cannot both believe they own the same embedded database, and a stale writer cannot silently overwrite a newer one.
+This recipe keeps the four tables needed for the example: `memories`, `memory_history`, `raw_transcripts`, and `events`.
 
-Now the limits, stated plainly:
-
-- It is single-writer. That is a feature for a per-user or per-project brain and a non-starter for a shared team database.
-- The V1 WAL replays write statements, so those statements need to be deterministic. `now()` in an `INSERT` is the classic thing to avoid.
-- It is not an OLTP database and not a Postgres replacement. High-frequency point updates and multi-writer transactions belong elsewhere.
-
-## Why this isn't just another storage backend
-
-If all you need is "save this checkpoint," SQLite is already enough. Adding one more backend to that list would not be interesting.
-
-What chDB durable adds is a deployment shape that did not exist before: embedded OLAP compute over a recoverable working copy, with the authoritative copy in storage you own and no service in between.
-
-- Local compute: hot queries stay in the agent process.
-- Analytical layout: MergeTree is built for compressed append-heavy history, batch retrieval, filtering, aggregation, and vector-assisted search.
-- Portable durability: the same object can be restored on another laptop, in CI, or inside a short-lived sandbox.
-- Explicit control: the application chooses when to flush and when to checkpoint.
-- Nothing to run: no database server, no PVC, no sidecar replication process.
-
-SQLite durability keeps local state from disappearing. chDB durable keeps local *analytical* state from disappearing, and lets the agent keep analyzing it.
-
-## What this buys you in practice
-
-Three things fell out of running this way that we had not fully priced in.
-
-**Run anywhere cheap, keep only the result.** The compute an agent runs in is increasingly disposable: a Lambda container, a Firecracker MicroVM, an E2B sandbox. With durable, that is fine. The agent does its analytical work in-process, calls `flush()` or `checkpoint()`, and the compute can vanish; the bucket stays, and the next run opens the same object from it. You pay for the seconds you ran plus object storage. The numbers already in this cookbook show how thin that compute layer can be: a [Lambda container](../aws-lambda/README.md) serves `/query` in about 255 ms once warm (cold start is ~34 s) and costs exactly zero while idle; a [Lambda MicroVM](../lambda-microvms/README.md) is running about 4 s after launch from a snapshot, answers a GROUP BY over 1M rows in 12 ms, and suspends with RAM and disk intact at no compute charge; an [E2B sandbox](../e2b-sandbox/README.md) creates in ~1.2 s, pauses in ~0.3 s, resumes in ~0.5 s, and bills per second. The MicroVM recipe already names S3-backed durable state as its planned 2.0. And the hot path really does stay local: in our [local-vs-remote benchmark](https://github.com/auxten/agent-local-vs-remote), in-process queries returned at p50 1.1 ms / p99 2.8 ms, against p50 63 ms and a p99 of 450 ms to 2 s for a remote database, roughly a 58× gap at the median.
-
-**Append-only history compresses well, with one caveat.** Agent transcripts are append-only JSONL, and they pile up. Tens of gigabytes across agents and machines is normal; on one of our laptops (M4 Pro), Claude Code's `~/.claude/projects` held 2.5 GB in 1,449 files covering about three months (it deletes older transcripts after 30 days by default), and Codex's `~/.codex/sessions` held 15.4 GB in 1,287 files, roughly 18 GB in total. We loaded a 1.45 GB, 213,721-row sample of the Claude Code files into MergeTree with chdb 3.7.0: `CODEC(ZSTD(3))` brought it down to 521 MiB (2.66×), default LZ4 to 991 MiB (1.40×). The reason it is not higher is instructive: 0.8% of the rows were base64 screenshots, and they held 67% of the bytes. Excluding those, the text rows compressed 3.94× under ZSTD(3) (474 MiB to 120 MiB). With a typed table (timestamp, type, session, model, tokens, plus a JSON column for the rest), a GROUP BY on type took 7 ms and tokens-by-model 5 ms. The lesson went straight into the best practices below: keep transcripts as cold evidence under ZSTD, store binary blobs out of line, and keep the hot columns typed.
-
-**SQL straight over the raw JSONL, no import step.** You do not even need the table to start asking questions. chDB reads the files where they sit:
+<details>
+<summary>Show the SQL schema</summary>
 
 ```sql
--- event types, straight off the raw files: 1.45 GB, no import, 0.22 s
--- (file() does not expand ~, so spell out your home directory)
-SELECT JSONExtractString(json, 'type') AS type, count() AS n
-FROM file('/Users/you/.claude/projects/**/*.jsonl', JSONAsString)
-GROUP BY type ORDER BY n DESC;
+CREATE TABLE IF NOT EXISTS memories (
+    id            String,
+    content       String CODEC(ZSTD(3)),
+    kind          LowCardinality(String),
+    source        LowCardinality(String),
+    source_ref    String,
+    project_id    String,
+    privacy       LowCardinality(String),
+    tags          Array(String),
+    embedding     Array(Float32),
+    status        LowCardinality(String),
+    pinned        UInt8,
+    revises_id    String,
+    conflict_with Array(String),
+    created_at    DateTime64(3, 'UTC'),
+    updated_at    DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY id;
 
--- grep, but with a query planner: 0.14 s
-SELECT count()
-FROM file('/Users/you/.claude/projects/**/*.jsonl', JSONAsString)
-WHERE json LIKE '%MergeTree%';
+CREATE TABLE IF NOT EXISTS memory_history (
+    memory_id String,
+    version   UInt32,
+    op        LowCardinality(String),
+    content   String CODEC(ZSTD(3)),
+    edited_by String,
+    edited_at DateTime64(3, 'UTC'),
+    prev_id   String,
+    note      String
+)
+ENGINE = MergeTree
+ORDER BY (memory_id, version, edited_at);
+
+CREATE TABLE IF NOT EXISTS raw_transcripts (
+    id         String,
+    session_id String,
+    agent      LowCardinality(String),
+    project_id String,
+    role       LowCardinality(String),
+    text       String CODEC(ZSTD(3)),
+    text_hash  String,
+    meta_json  String CODEC(ZSTD(3)),
+    created_at DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+ORDER BY (session_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS events (
+    id           String,
+    kind         LowCardinality(String),
+    agent        LowCardinality(String),
+    project_id   String,
+    memory_id    String,
+    message      String,
+    payload_json String CODEC(ZSTD(3)),
+    created_at   DateTime64(3, 'UTC')
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(created_at)
+ORDER BY (created_at, kind, id)
+TTL toDateTime(created_at) + INTERVAL 30 DAY;
 ```
 
-On the same laptop and the same 1.45 GB, best of two runs: `count()` 0.16 s, rows and distinct sessions per day 0.27 s, the longest `tool_result` 0.28 s, output tokens by model 0.23 s, and a tool-call ranking via `arrayJoin(JSONExtractArrayRaw(json, 'message', 'content'))` 0.24 s. That is fast enough to explore before deciding what deserves a table.
+</details>
 
-Other people have noticed the same thing. [`ccsql`](https://github.com/Subara3/ccsql) by Subara3 (`pip install ccsql`) loads `~/.claude/projects/**/*.jsonl` into a 13-column MergeTree table, `cc_events`, ordered by `(project, ts)` with `LowCardinality` columns, and ships `cost`, `tools`, `cache`, `sessions`, and `heatmap` reports plus free-form SQL; the same DDL and queries run on ClickHouse Cloud with `--cloud`. The author's [write-up on Qiita](https://qiita.com/Subara3/items/c7b4e38fc4b714b8d876) went through 112 files and 289 MB of logs and found about ¥560k (roughly $3,494) of API-equivalent spend in June alone; 5M synthetic rows took 162.84 MiB on disk, and daily-by-model aggregates ran in 122–208 ms. [`claude-scope`](https://github.com/Wachynaky/claude-scope) does something similar as a local dashboard. This is exactly the `raw_evidence` table from the next section: ccsql shows the ingest side, and durable makes the resulting MergeTree portable.
+The tables have no `DEFAULT now()` expressions. Durable V1 stores mutation statements in the WAL and runs them again during recovery. The application therefore generates each ID and timestamp once, then writes the value as a SQL literal.
 
-## Best practices
+## Remembering one decision
 
-These come from building on it ourselves, and from watching the projects in the next section.
+The `remember` command performs two distinct actions. It first saves the transcript as evidence. It then promotes the reviewed decision into `memories` and records version 1 in `memory_history`.
 
-**Model memory as append-heavy tables, not a document.** The tables that keep paying for themselves are: `memories` (current beliefs), `memory_history` (every revision as a new row), `raw_evidence` (transcripts and tool output kept cold), `recall_traces` (what was retrieved, for which query, and whether it helped), `conflicts` (semantically close rows that disagree), and `tool_events`. Append rows with a `version` or timestamp, soft-delete with a flag, and derive "current state" with `ORDER BY version DESC LIMIT 1 BY memory_id`. The agents post above walks through the schema and the three queries (current state, full history, point-in-time) that fall out of it.
+```python
+transcript = "User confirmed: deploy checkout-api to eu-west-1."
+created_at = utc_now()  # generated once; the SQL contains the resulting literal
 
-**Keep raw evidence cold, compressed, and free of blobs.** Put transcripts and tool output in `raw_evidence` with `CODEC(ZSTD(3))`; text compresses about 4× there, and nobody reads it on the hot path. Store screenshots and other binary payloads out of line (in the bucket, referenced by key), or they will dominate every checkpoint. Keep the columns you actually filter and group on typed and `LowCardinality` where it fits, so the hot queries never touch the JSON column.
+obj.execute("INSERT INTO raw_transcripts ...")
+obj.execute("INSERT INTO memories ...")
+obj.execute("INSERT INTO memory_history ...")
+obj.execute("INSERT INTO events ...")
+obj.flush()
+```
 
-**Flush after meaningful batches, not after every row.** Agents write in a trickle. Let the working copy absorb the trickle and call `flush()` at boundaries that mean something: end of a task, end of a tool loop, every N committed memories. The gap between flushes is exactly the window you are willing to lose.
+Those four statements are committed in order in one WAL segment. They are not a multi-statement SQL transaction. An application that needs a stronger invariant should express it in one deterministic statement or validate the group during recovery.
 
-**Checkpoint at compaction points.** Checkpoint after bulk imports, after a burst of revisions, at the end of a long session, or before handing the object to another host. A fresh base makes the next open fast and keeps the log short.
+Raw transcripts never become memory automatically. A temporary request, an error message, or an untrusted tool result can remain searchable evidence without changing future agent behavior.
 
-**One writer per object name.** The lease enforces this; design for it rather than around it. If two workers need to write concurrently, they need two objects, or a server-backed database.
+## Recovering and recalling
 
-**One namespace per user or project.** `Namespace("s3://bucket/agent-memory", owner=...)` with objects named `user-123` or `org/repo` keeps blast radius small, makes deletion a prefix operation, and lets many objects be listed and queried later.
+The `recall` command opens the object read-only. A read-only handle takes no writer lease and sees the committed manifest as it stood at open.
 
-**Know when to reach for a server instead.** Multi-writer collaboration, sub-millisecond point updates from many clients, a working set larger than the local disk, or a compliance requirement for a centrally managed database: use server ClickHouse or Postgres. The SQL and the MergeTree layout carry over, so graduating later is a `remote()` away rather than a rewrite.
+```python
+namespace = cd.Namespace(os.environ["CHDB_DURABLE_URL"])
+obj = namespace.open("acme-checkout-api", read_only=True)
 
-## Worked example: ClickMem
+result = obj.query(
+    """
+    SELECT id, content, kind, tags, source_ref
+    FROM memories FINAL
+    WHERE project_id = 'acme/checkout-api'
+      AND status = 'active'
+      AND (positionCaseInsensitiveUTF8(content, 'deploy') > 0
+           OR has(tags, 'deployment'))
+    ORDER BY pinned DESC, updated_at DESC
+    LIMIT 5
+    """,
+    "JSONEachRow",
+)
+print(result.data())
+obj.close()
+```
 
-![Four real projects, four durable needs for embedded chDB](assets/chdb-durable-use-cases-humanized.svg)
+The SQL runs locally. S3 is used during `open()`, `flush()`, and `checkpoint()`, not for every recall query.
 
-[ClickMem](https://github.com/auxten/clickmem) is the project that pushed us here, so it is the clearest illustration of what durable is for.
+The example ranks by typed fields and text so the storage lifecycle remains easy to follow. A memory system can fill the `embedding` column and use `cosineDistance` for semantic candidates without changing the durability model.
 
-ClickMem is deliberately not a "chat history vector database." Nothing becomes memory by accident. A memory enters the store only when a user or an agent explicitly commits it (`clickmem_remember`), or when a curated document such as `AGENTS.md` or `.cursor/rules/*.mdc` is imported. Raw transcripts are kept as cold evidence: searchable, auditable, never injected into context as "memory." On top of that sits a belief-revision model with five operations: expand (add), revise, contract (forget, without pretending it never existed), reinforce (pin as authoritative), and refuse (blacklist content that must never become memory). When a new memory is semantically close to an existing one but says something different, both rows are flagged as a conflict until someone resolves it. Every recall can produce a trace explaining why each result matched.
+## Revising instead of overwriting history
 
-Look at that as data and it is exactly the table list from the previous section: committed memories, a revision history, cold transcripts, conflict rows, recall traces, plus scopes (project, privacy, tags) on top. The questions ClickMem's dashboard answers are history queries: show me how this belief evolved, show me the open conflicts side by side, show me why this recall matched and which transcript a memory came from. That is why it runs on chDB and MergeTree rather than a key-value store.
+The deployment region later changes to `eu-central-1`. The recipe inserts a newer `memories` row with the same ID and appends version 2 to `memory_history`.
 
-Today ClickMem stores that state in one of two places: embedded chDB at `~/.clickmem/data` for a single machine or a LAN-shared host, or a ClickHouse server when several devices need the same memory. It also ships `export` / `import` (JSONL, embeddings included) for moving a brain by hand.
+`ReplacingMergeTree(updated_at)` and `FINAL` return the latest current row. The history table still answers how the decision changed. Forgetting follows the same pattern: insert a new current row with `status='contracted'` and append a `contract` history row.
 
-chDB durable adds the third shape, the one between those two. The hot path stays embedded; recall is still a local query. The authoritative copy of each user's or project's memory lives in that user's bucket. The same object can be reopened on another laptop, in a CI job that needs the project's rules, or inside a sandbox that will be gone in an hour. Flush after each committed memory batch, checkpoint after imports and conflict resolution, one object per project, and the memory safe stops depending on which machine it was built on.
+The command finishes with `checkpoint()` because a completed revision pass is a useful compaction point:
 
-## Three more shapes of the same problem
+```python
+obj.execute("INSERT INTO memories ...")
+obj.execute("INSERT INTO memory_history ...")
+obj.execute("INSERT INTO events ...")
+base_key = obj.checkpoint()
+print(f"revision checkpoint: {base_key}")
+```
 
-Agent memory is the loudest case, but the pattern shows up wherever an embedded analytical database stops being disposable.
+## Practices that matter in production
 
-**[Maple Local](https://maple.dev/docs/local-mode/): local-first observability.** Maple Local receives traces, logs, and metrics, embeds chDB, and serves local queries and dashboards. Once that database holds telemetry that took days to collect, durability stops being a nice-to-have: crash recovery, dirty-store recovery, checkpointing, and restore all become product concerns. Durable turns that recovery pattern into a database-level primitive, and leaves the application in charge of when to flush, when to checkpoint, and how to name each object.
+### Flush when the application makes a promise
 
-**[ReplayHouse](https://github.com/jaymebrd/replayhouse): replay buffers and training state.** ReplayHouse is a replay buffer on ClickHouse with an embedded chDB backend for local work: store trajectories and scored rollouts, sample weighted batches, write training errors back as priorities, query exactly the rows the trainer consumed. That is durable state hiding in plain sight. A buffer holds expensive experience collected over long runs, and with durable it can be flushed per batch, epoch, or milestone and follow the run from laptop to CI to training box. Because it is still chDB, sampling distribution and priority drift remain one SQL query away.
+Batch low-value events if a short recovery window is acceptable. Flush a decision that changes future agent behavior before returning success. The interval between successful flushes is the amount of recent work the application has chosen to risk.
 
-**[vcfclick](https://github.com/nuin/vcfclick): expensive ingest, ready-to-query data.** vcfclick is a research-bioinformatics VCF database built on an embedded ClickHouse engine, with DuckDB-based annotations and an MCP natural-language layer. Here the raw VCF files already live somewhere safe. The expensive part is the prepared state: imported, normalized, annotated, indexed, ready to query. Without a durable checkpoint every new machine repeats the import. With one, a prepared cohort database is checkpointed once and restored anywhere as a local query replica.
+### Put deterministic statements in the WAL
 
-## What comes next
+Generate timestamps, UUIDs, random values, and model output in the application, then write literals. Avoid `now()`, `rand()`, `generateUUIDv4()`, and `INSERT ... SELECT` from a changing external source. Finish non-deterministic bulk work locally and use `checkpoint()` to preserve the resulting database.
 
-Durable is available on the Python side today, which is enough to validate it on agent memory, replay buffers, prepared cohort databases, and local observability collectors. The next steps are about making it a stable, cross-language capability:
+### Checkpoint after work that shortens future recovery
 
-1. Freeze the durable protocol: object layout, `head.json`, checkpoints, WAL, CAS semantics, leases, error surface, and conformance fixtures.
-2. Move the minimal engine primitives into `chdb-core` and expose them through `libchdb.so`: backup, restore, and SQL classification, so bindings do not have to guess what a statement does by string matching.
-3. Keep Python as the reference implementation.
-4. Bring the same semantics to Node/Bun/Deno, Go, Rust, and other bindings over time.
-5. Bring the `gcs://` and `azure://` backends up to the same test coverage as S3 and MinIO, with conformance fixtures that make every backend prove the same lease and fencing behavior.
+Good checkpoint points include a bulk import, a large revision or conflict-resolution pass, the end of a long session, and a handoff to another host. Calling it after every row adds transfer work without improving the semantics of `flush()`.
 
-Durable is one layer; the engine under it already runs in most serverless shapes. The same in-process chDB ships as the [`chdb-serverless`](https://pypi.org/project/chdb-serverless/) analyst on [AWS Lambda](../aws-lambda/README.md), [Lambda MicroVMs](../lambda-microvms/README.md), [Google Cloud Run](../gcp-cloud-run/README.md), and [Azure Container Apps](../azure-container-apps/README.md), and inside an [E2B sandbox](../e2b-sandbox/README.md); the [series hub](../serverless-analyst/README.md) compares them, and the package's `CHDB_STORE=durable:` seam is where this backend plugs in. chDB was also a launch partner for [AWS Lambda MicroVMs](https://aws.amazon.com/lambda/lambda-microvms/) when AWS [announced them on June 22, 2026](https://aws.amazon.com/about-aws/whats-new/2026/06/aws-lambda-microvms/); the [agents post](https://clickhouse.com/blog/chdb-agents-local-data-engine) walks through that pairing.
+### Let the object boundary follow the writer boundary
 
-Cloudflare Workers is the honest exception. [`chdb-cloudflare`](https://www.npmjs.com/package/chdb-cloudflare) is a size-optimized JavaScript/WebAssembly build (about 8.4 MiB gzipped, within the Worker size limit) that is single-threaded and has no MergeTree, so it cannot host a durable object, and Python Workers are not supported at all. What it can do inside a Worker: Memory tables, `file()` over an in-memory filesystem fed from JS, and single-object `url()` / `s3()` reads of Parquet or gzip JSONL from R2, while writes and compare-and-swap happen in JS through the R2 binding rather than in SQL; there is no SQLite, so no D1 bridge, and we have not run the R2 read path end to end yet. When you need MergeTree or real durability, run full chDB in Cloudflare Containers against R2, which supports the conditional writes durable relies on.
+Durable V1 allows one writer per object and enforces that rule with a lease and fencing. One project or one user per object is usually a good fit. Workloads that require concurrent writers to one database should use separate objects or a server database.
 
-For the growing class of local-first, agent-first, and serverless-first applications, the middle tier is the piece that was missing: no database server, no PVC, no sidecar, and still a fast embedded analytical database whose state can survive the host.
+The lease coordinates writers. Bucket IAM controls access. Give each tenant credentials scoped to its own prefix and use the storage provider's encryption controls where needed.
 
-The future of agent memory may not be a bigger context window.
+### Keep large binary values outside the database
 
-It may be a local analytical brain that knows how to survive.
+Typed columns work well for project, kind, privacy, status, tags, and timestamps. Transcript text compresses well with ZSTD. Screenshots, audio, and other large binary values should live in object storage, with their keys recorded in a table. Otherwise each full checkpoint has to move the blobs again.
 
-## Try next
+### Open one Durable object per process
 
-- `pip install "chdb[durable]"`, open a namespace on a bucket you own, and point an existing chDB memory table at it.
-- If you have use cases, questions, or design feedback on chDB durable, open a discussion issue in [chdb-io/chdb](https://github.com/chdb-io/chdb/issues).
+chdb-core currently binds one data path per process. Scan a small number of objects one after another, or use worker processes for parallel fan-out.
+
+## Other language bindings
+
+Durable V1 defines the same object layout, WAL, checkpoints, lease behavior, fencing, and error categories for every binding. SQL and table definitions can stay the same.
+
+Binding status, checked on 2026-09-15:
+
+| Binding | Availability | Write-specific durability barrier |
+|---|---|---|
+| Python | Released in chDB 4.4.0 | Call `flush()` for the current buffer |
+| Go | Tagged in `chdb-go` v2.2.0 | `FlushThrough(ctx, ticket)` |
+| Node.js | Experimental on `main`; not in the v3.3.0 tag | `flushThrough(ticket)` |
+| Rust | Experimental on `main`; not in the v1.4.0 tag | `flush_through(ticket)` |
+
+| Operation | Python | Node.js | Go | Rust |
+|---|---|---|---|---|
+| Namespace | `cd.Namespace(...)` | `new DurableNamespace(...)` | `durable.NewNamespace(...)` | `Namespace::new(...)` |
+| Open | `ns.open(id)` | `await ns.open(id)` | `ns.Open(ctx, id, opts)` | `ns.open(id, opts)` |
+| Read | `obj.query(...)` | `await obj.query(...)` | `obj.Query(...)` | `obj.query(...)` |
+| Write | `obj.execute(...)` | `await obj.execute(...)` | `obj.Execute(...)` | `obj.execute(...)` |
+| Flush | `obj.flush()` | `await obj.flush()` | `obj.Flush(ctx)` | `obj.flush()` |
+| Checkpoint | `obj.checkpoint()` | `await obj.checkpoint()` | `obj.Checkpoint(ctx)` | `obj.checkpoint()` |
+| Close | `obj.close()` | `await obj.close()` | `obj.Close(ctx)` | `obj.close()` |
+
+<details>
+<summary>Node.js minimal writer</summary>
+
+```ts
+import { DurableNamespace, nodeEngineFactory } from 'chdb/durable/node'
+import 'chdb/durable/s3'
+
+const ns = new DurableNamespace('s3://my-agent-state/agent-memory', {
+  engineFactory: nodeEngineFactory(),
+  owner: 'node-agent',
+})
+const obj = await ns.open('acme-checkout-api', { database: 'mem' })
+const ticket = await obj.execute(
+  "INSERT INTO events VALUES ('evt-1', 'recall.run', 'node-agent', " +
+  "'acme/checkout-api', '', 'recalled 1 memory', " +
+  "'{\"hit_ids\":[\"mem-deploy-region\"]}', '2026-09-15 09:00:00.000')",
+)
+await obj.flushThrough(ticket)
+await obj.close()
+```
+
+</details>
+
+<details>
+<summary>Go minimal writer</summary>
+
+```go
+ns, err := durable.NewNamespace(
+    "s3://my-agent-state/agent-memory",
+    durable.NamespaceOptions{Owner: "go-agent"},
+)
+if err != nil { log.Fatal(err) }
+
+obj, _, err := ns.Open(ctx, "acme-checkout-api", durable.OpenOptions{Database: "mem"})
+if err != nil { log.Fatal(err) }
+
+ticket, err := obj.Execute(ctx,
+    "INSERT INTO events VALUES ('evt-1', 'recall.run', 'go-agent', "+
+        "'acme/checkout-api', '', 'recalled 1 memory', "+
+        "'{\"hit_ids\":[\"mem-deploy-region\"]}', '2026-09-15 09:00:00.000')")
+if err == nil { err = obj.FlushThrough(ctx, ticket) }
+if closeErr := obj.Close(ctx); err == nil { err = closeErr }
+if err != nil { log.Fatal(err) }
+```
+
+</details>
+
+<details>
+<summary>Rust minimal writer</summary>
+
+```rust
+use chdb_rust::durable::{Namespace, OpenOptions};
+
+let ns = Namespace::new("s3://my-agent-state/agent-memory")?
+    .with_owner("rust-agent");
+let (obj, _) = ns.open(
+    "acme-checkout-api",
+    OpenOptions {
+        database: Some("mem".to_string()),
+        ..OpenOptions::default()
+    },
+)?;
+let ticket = obj.execute(
+    "INSERT INTO events VALUES ('evt-1', 'recall.run', 'rust-agent', \
+     'acme/checkout-api', '', 'recalled 1 memory', \
+     '{\"hit_ids\":[\"mem-deploy-region\"]}', '2026-09-15 09:00:00.000')",
+)?;
+obj.flush_through(ticket)?;
+obj.close()?;
+```
+
+</details>
+
+Check the binding's release notes before using a preview API in production.
+
+## When to use a server
+
+Use server-side ClickHouse, Postgres, or another shared service when several writers must update the same database, many clients need continuous online access, the working set is larger than local disk, or governance requires a centrally managed service.
+
+Plain local chDB is enough when the database is disposable or stays on one host. A small transactional store is simpler when the application only saves runtime checkpoints and does not query memory history.
+
+Durable fits workloads where one process owns a local analytical database at a time, queries should stay in-process, and committed state must be recoverable on another host.
+
+## References
+
+- [chDB Durable overview](https://github.com/chdb-io/chdb/blob/main/docs/durable/index.mdx)
+- [Durable V1 contract](https://github.com/chdb-io/chdb/blob/main/dev-docs/CHDB_DURABLE_V1_CONTRACT.md)
+- [Durable V1 protocol reference](https://github.com/chdb-io/chdb/blob/main/docs/durable/protocol-v1.mdx)
+- [ClickMem schema at commit `7f9180c`](https://github.com/auxten/clickmem/blob/7f9180ce2a8f2d151bde43ba9eee2e9463afa573/src/clickmem/schema.py)
+- [ClickMem recall implementation](https://github.com/auxten/clickmem/blob/7f9180ce2a8f2d151bde43ba9eee2e9463afa573/src/clickmem/recall.py)
+- [Python v4.4.0 release](https://github.com/chdb-io/chdb/releases/tag/v4.4.0)
+- [Go v2.2.0 Durable package](https://github.com/chdb-io/chdb-go/tree/v2.2.0/chdb/durable)
+- [Node.js Durable source on `main`](https://github.com/chdb-io/chdb-node/tree/main/src/durable)
+- [Rust Durable source on `main`](https://github.com/chdb-io/chdb-rust/tree/main/src/durable)
